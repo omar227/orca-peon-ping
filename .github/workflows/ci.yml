@@ -3,7 +3,7 @@
 # Orca is not installed on GitHub-hosted runners, so this workflow cannot run
 # `orca plugin validate .`, `orca plugin test .`, or `orca plugin check .` — the
 # commands that actually prove the manifest is well-formed, the panel renders, and
-# the plugin's 111 tests pass. A green check here is NOT evidence that the plugin
+# the plugin's tests pass. A green check here is NOT evidence that the plugin
 # works in Orca.
 #
 # Those commands run locally, where Orca is installed, and are the project's
