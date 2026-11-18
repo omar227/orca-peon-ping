@@ -713,3 +713,62 @@ test('a preview for a root-level pack does not put a "." in its URL', async () =
 
   assert.equal(urls[0], 'https://raw.githubusercontent.com/a/b/v1.0.1/sounds/villager_idle1.ogg')
 })
+
+/**
+ * Every `source_path` shape the live registry actually uses, driven through `install()` against
+ * an archive built to match. Counted from the real index: `"."` 214, one segment 162, `""` 3
+ * (`fibi-chuppi`, `itysl`, `solid_snake`), nested 3 (the `teen-titans` packs), absent 0.
+ *
+ * Two of these four shipped broken, one after the other, because no test ever drove an archive
+ * whose layout matched the field. `""` arrives here as `undefined`, because the registry parser
+ * normalises an empty string away — so both spellings are exercised.
+ */
+const SOURCE_PATH_SHAPES: { label: string; sourcePath: string | undefined; packAt: string }[] = [
+  { label: 'the repository root, spelled "."', sourcePath: '.', packAt: '' },
+  { label: 'the repository root, spelled ""', sourcePath: '', packAt: '' },
+  { label: 'the repository root, with the field dropped by the parser', sourcePath: undefined, packAt: '' },
+  { label: 'one segment', sourcePath: 'peon', packAt: 'peon' },
+  { label: 'nested', sourcePath: 'packs/raven', packAt: 'packs/raven' },
+  { label: 'one segment written as "./peon"', sourcePath: './peon', packAt: 'peon' }
+]
+
+for (const shape of SOURCE_PATH_SHAPES) {
+  test(`a pack whose source_path names ${shape.label} installs with its manifest at the pack root`, async () => {
+    const bytes = buildTarball((root) => {
+      const packRoot = shape.packAt === '' ? root : join(root, ...shape.packAt.split('/'))
+      mkdirSync(join(packRoot, 'sounds'), { recursive: true })
+      writeFileSync(join(packRoot, 'openpeon.json'), manifestJson('peon', '1.0.0', 'hello.wav'))
+      writeFileSync(join(packRoot, 'sounds', 'hello.wav'), 'fake-audio')
+    })
+    const store = new Store(memoryStoreApi())
+    const installer = new PackInstaller(store, { home: tmpHome, fetchImpl: serving(bytes) })
+
+    await installer.install({ ...entry, source_path: shape.sourcePath })
+
+    const dir = packDir('peon', tmpHome)
+    assert.ok(existsSync(join(dir, 'openpeon.json')), 'openpeon.json must land at the pack root')
+    assert.ok(existsSync(join(dir, 'sounds', 'hello.wav')))
+    assert.deepEqual(packsRootEntries(), ['peon'])
+  })
+}
+
+test('a source_path that climbs out of the archive is refused before tar is asked', async () => {
+  const installer = new PackInstaller(new Store(memoryStoreApi()), {
+    home: tmpHome,
+    fetchImpl: serving(packTarball())
+  })
+  for (const bad of ['..', '../..', 'peon/../..', './..']) {
+    await assert.rejects(
+      () => installer.install({ ...entry, source_path: bad }),
+      /escapes the archive/,
+      `allowed: ${bad}`
+    )
+  }
+  assert.deepEqual(packsRootEntries(), [])
+})
+
+test('tarEntryTarget refuses a member that is the destination itself', () => {
+  assert.throws(() => tarEntryTarget('/tmp/dest', '.'))
+  assert.throws(() => tarEntryTarget('/tmp/dest', 'peon/..'))
+  assert.equal(tarEntryTarget('/tmp/dest', 'peon'), '/tmp/dest/peon')
+})

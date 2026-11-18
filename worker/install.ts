@@ -47,6 +47,10 @@ export const MANIFEST_FILE = 'openpeon.json'
  * compresses well. The extraction cap is enforced *during* decompression, before `tar` writes
  * anything, because a gzip bomb that passed the download cap could otherwise put 150 GB on the
  * disk and only then be measured; the unpacked tree is measured afterwards as a backstop.
+ *
+ * What that costs in staging, at the worst: the `.tar.gz` is deleted as soon as it has been
+ * decompressed, so the peak is the capped `pack.tar` plus the subtree tar writes out of it —
+ * **up to ~600 MB**, not 300. Every path through `install()` deletes the staging directory.
  */
 export const MAX_DOWNLOAD_BYTES = 150 * 1024 * 1024
 export const MAX_EXTRACTED_BYTES = 300 * 1024 * 1024
@@ -89,7 +93,10 @@ export function tarEntryTarget(destDir: string, entryPath: string): string {
 
   const dest = resolve(destDir)
   const target = resolve(dest, entryPath)
-  if (target !== dest && !target.startsWith(dest + sep)) {
+  // Strictly inside: a member that resolves to the destination itself is not a file to extract,
+  // and allowing it let `source_path: ".."` through this gate to be stopped only by tar failing
+  // to find the member. `sourcePathOf` refuses `..` outright now; this is the second lock.
+  if (!target.startsWith(dest + sep)) {
     throw new Error(`tar entry escapes the destination: ${entryPath}`)
   }
   return target
@@ -203,20 +210,39 @@ function archiveRootOf(entryPaths: readonly string[]): string {
  * Where the pack sits inside the tag archive, as a path relative to the archive's single root
  * directory — or `''` when the pack *is* the repository root.
  *
- * `source_path: "."` is not an edge case: **214 of the registry's 382 entries use it**, which is
- * every pack that lives in a repository of its own. It used to come back as the literal `.`, so
- * the tar member was `root/.` and `--strip-components` was computed as 2, which stripped
- * `openpeon.json` out of existence and failed the install with "has no openpeon.json". The
- * default `peon` pack is in a shared repository with `source_path: "peon"`, which is why first
- * run worked and this never showed up.
+ * The census of the live registry's 382 entries, counted rather than assumed:
+ *
+ * | `source_path` | entries | meaning |
+ * |---|---|---|
+ * | `"."` | 214 | the pack is the repository |
+ * | one segment, e.g. `"peon"` | 162 | a pack inside a shared repository |
+ * | `""` | 3 | `fibi-chuppi`, `itysl`, `solid_snake` — the same as `"."` |
+ * | nested, e.g. `"packs/raven"` | 3 | the three `teen-titans` packs |
+ * | absent | 0 | nobody omits the field |
+ *
+ * Both of the first two "it is the repository" spellings used to be got wrong, and both failed
+ * with an opaque tar error. `"."` came back literally, so the member was `root/.` and
+ * `--strip-components` came out as 2, which stripped `openpeon.json` out of existence. `""` was
+ * normalised to `undefined` by the registry parser and then resolved to the pack *name*, so tar
+ * was asked for a directory that is not in the archive at all. Since no entry genuinely omits
+ * the field, there is no `?? entry.name` fallback any more: the thing it existed for never
+ * happens, and all it did was turn an empty value into a wrong one.
+ *
+ * The path is normalised rather than taken as written, because the registry is third-party and
+ * mutable: `"./peon"` would otherwise count the `.` toward `--strip-components` and install
+ * nothing, which is this same bug wearing a different hat. A `..` segment is refused outright.
  */
 function sourcePathOf(entry: RegistryPack): string {
-  const raw = entry.source_path ?? entry.name
-  const trimmed = raw.replace(/^\/+|\/+$/g, '')
-  if (trimmed.length === 0) {
-    throw new Error(`registry entry ${entry.name} has an empty source_path`)
+  const raw = entry.source_path ?? ''
+  const segments: string[] = []
+  for (const segment of raw.split('/')) {
+    if (segment === '' || segment === '.') continue
+    if (segment === '..') {
+      throw new Error(`registry entry ${entry.name} has a source_path that escapes the archive`)
+    }
+    segments.push(segment)
   }
-  return trimmed === '.' ? '' : trimmed
+  return segments.join('/')
 }
 
 /**
@@ -456,6 +482,10 @@ export class PackInstaller {
     const listing = await runTar(['-tf', archive])
     const entryPaths = listing.split('\n').filter((line) => line.length > 0)
     for (const entryPath of entryPaths) {
+      // `.` and `./` are some tars' way of naming the directory being archived, not a member to
+      // extract. GitHub's archives do not emit them, but refusing one outright would fail a
+      // whole legitimate pack over a naming convention.
+      if (entryPath === '.' || entryPath === './') continue
       tarEntryTarget(into, entryPath)
     }
 
