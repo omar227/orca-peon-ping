@@ -2,6 +2,8 @@ import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import {
   closeSync,
+  createReadStream,
+  createWriteStream,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -16,6 +18,9 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { Transform } from 'node:stream'
+import { pipeline } from 'node:stream/promises'
+import { createGunzip } from 'node:zlib'
 import { type CespManifest, parseManifest, resolveSoundPath } from './cesp.ts'
 import { packDir, packsRoot } from './paths.ts'
 import type { RegistryPack } from './registry.ts'
@@ -39,11 +44,20 @@ export const MANIFEST_FILE = 'openpeon.json'
  * v1.1.0 tag is 62,009,213 bytes). Any cap at or below 64 MB would therefore break the default
  * install, which is the plugin's own headline failure. 150 MB leaves ~2.5x headroom over the
  * largest archive the plugin is known to need, and 300 MB extracted allows for an archive that
- * compresses well without letting a gzip bomb fill the disk: the staging tree is measured and
- * deleted before anything is moved into place.
+ * compresses well. The extraction cap is enforced *during* decompression, before `tar` writes
+ * anything, because a gzip bomb that passed the download cap could otherwise put 150 GB on the
+ * disk and only then be measured; the unpacked tree is measured afterwards as a backstop.
  */
 export const MAX_DOWNLOAD_BYTES = 150 * 1024 * 1024
 export const MAX_EXTRACTED_BYTES = 300 * 1024 * 1024
+
+/**
+ * What `tar`'s listing of an archive may come to in memory. The listing is read into one JS
+ * string to be path-checked, so an archive of very many tiny entries is a way to OOM the worker
+ * that never goes near the download or the extraction caps. 16 MiB is around 200,000 paths —
+ * far past any real pack repository, and far short of a problem.
+ */
+export const MAX_TAR_LISTING_BYTES = 16 * 1024 * 1024
 
 /** Called with the running total of bytes downloaded, so the panel can show progress. */
 export type InstallProgress = (downloadedBytes: number) => void
@@ -101,21 +115,48 @@ function sha256(bytes: Buffer): string {
   return createHash('sha256').update(bytes).digest('hex')
 }
 
-function runTar(args: readonly string[]): Promise<string> {
+/**
+ * Runs `tar` and returns its stdout, which is bounded: a listing past `maxStdoutBytes` kills the
+ * child and fails the install rather than growing a string until the worker dies. stderr is
+ * bounded by the same number, for the same reason.
+ */
+export function runTar(
+  args: readonly string[],
+  options?: { maxStdoutBytes?: number }
+): Promise<string> {
+  const limit = options?.maxStdoutBytes ?? MAX_TAR_LISTING_BYTES
   return new Promise((fulfil, reject) => {
     const child = spawn('tar', [...args], { stdio: ['ignore', 'pipe', 'pipe'] })
     let stdout = ''
     let stderr = ''
+    let settled = false
+    const fail = (error: Error): void => {
+      if (settled) return
+      settled = true
+      child.kill('SIGKILL')
+      reject(error)
+    }
+
     child.stdout.setEncoding('utf8')
     child.stderr.setEncoding('utf8')
     child.stdout.on('data', (chunk: string) => {
       stdout += chunk
+      if (stdout.length > limit) {
+        fail(
+          new Error(
+            `the pack archive lists more than ${sizeLabel(limit)} of file names, which is too ` +
+              'many for this plugin to install. Install it with the peon-ping CLI.'
+          )
+        )
+      }
     })
     child.stderr.on('data', (chunk: string) => {
-      stderr += chunk
+      if (stderr.length <= limit) stderr += chunk
     })
-    child.on('error', (err) => reject(new Error(`could not run tar: ${err.message}`)))
+    child.on('error', (err) => fail(new Error(`could not run tar: ${err.message}`)))
     child.on('close', (code) => {
+      if (settled) return
+      settled = true
       if (code === 0) {
         fulfil(stdout)
       } else {
@@ -123,6 +164,26 @@ function runTar(args: readonly string[]): Promise<string> {
       }
     })
   })
+}
+
+/**
+ * `fs.writeSync` is allowed to write fewer bytes than it was given, so a single call per chunk
+ * could silently truncate the staged archive and surface later as an opaque `tar exited with 1`.
+ * The writer is injectable so the short-write path itself can be tested.
+ */
+export function writeFully(
+  fd: number,
+  bytes: Uint8Array,
+  write: (fd: number, bytes: Uint8Array, offset: number, length: number) => number = writeSync
+): void {
+  let written = 0
+  while (written < bytes.byteLength) {
+    const n = write(fd, bytes, written, bytes.byteLength - written)
+    if (n <= 0) {
+      throw new Error(`could not write the pack archive: ${written} of ${bytes.byteLength} bytes`)
+    }
+    written += n
+  }
 }
 
 /** The single top-level directory GitHub wraps a tag archive in, e.g. `og-packs-1.1.0`. */
@@ -178,7 +239,8 @@ function assertPlainTree(dir: string, root: string): number {
 }
 
 /** Sizes in the error messages a person reads, so "150 MB" is what they see, not 157286400. */
-function megabytes(bytes: number): string {
+function sizeLabel(bytes: number): string {
+  if (bytes < 1024 * 1024) return `${bytes} bytes`
   return `${Math.round(bytes / (1024 * 1024))} MB`
 }
 
@@ -238,14 +300,25 @@ export class PackInstaller {
       const tarball = join(staging, 'pack.tar.gz')
       await this.#downloadTarball(entry, tarball, onProgress)
 
+      // Decompression happens here, once, with a counter in the middle of it — before `tar`
+      // writes a single byte. That is what bounds a gzip bomb: at gzip's ~1030:1 ceiling an
+      // archive small enough to pass the download cap could otherwise unpack 150 GB into the
+      // staging directory, and measuring the tree afterwards would be measuring a full disk.
+      // Unpacking to a plain `.tar` first also means the listing pass and the extraction pass
+      // no longer decompress the whole archive twice over.
+      const archive = join(staging, 'pack.tar')
+      await this.#gunzip(entry, tarball, archive)
+      rmSync(tarball, { force: true })
+
       const extracted = join(staging, 'extract')
       mkdirSync(extracted)
-      await this.#extractPack(entry, tarball, extracted)
+      await this.#extractPack(entry, archive, extracted)
+      // A backstop on what actually landed, in case tar ever writes more than it was handed.
       const unpackedBytes = assertPlainTree(extracted, extracted)
       if (unpackedBytes > this.#maxExtractedBytes) {
         throw new Error(
-          `pack ${entry.name} unpacks to ${unpackedBytes} bytes, more than the ` +
-            `${this.#maxExtractedBytes} Peon Ping will install. Nothing was kept. ` +
+          `pack ${entry.name} unpacks to ${sizeLabel(unpackedBytes)}, more than the ` +
+            `${sizeLabel(this.#maxExtractedBytes)} Peon Ping will install. Nothing was kept. ` +
             'Install it with the peon-ping CLI if you really want a pack this large.'
         )
       }
@@ -314,7 +387,7 @@ export class PackInstaller {
         if (done) break
         downloaded += value.byteLength
         this.#assertWithinDownloadCap(entry, downloaded, reader)
-        writeSync(file, value)
+        writeFully(file, value)
         onProgress?.(downloaded)
       }
     } finally {
@@ -332,15 +405,44 @@ export class PackInstaller {
     // Stop pulling bytes before failing, so an endless archive does not keep the socket busy.
     void reader?.cancel().catch(() => {})
     throw new Error(
-      `pack ${entry.name} is larger than the ${megabytes(MAX_DOWNLOAD_BYTES)} Peon Ping will ` +
-        `download: the download was stopped after ${megabytes(downloaded)} and nothing was ` +
+      `pack ${entry.name} is larger than the ${sizeLabel(MAX_DOWNLOAD_BYTES)} Peon Ping will ` +
+        `download: the download was stopped after ${sizeLabel(downloaded)} and nothing was ` +
         'kept. Ask the pack author for a smaller archive, or install it with the peon-ping CLI.'
     )
   }
 
+  /**
+   * Decompresses the staged archive, counting the decompressed bytes and failing the install the
+   * moment they pass the cap. `pipeline` destroys the whole chain on that error, so gzip stops
+   * being read and the partial `.tar` goes with the staging directory.
+   */
+  async #gunzip(entry: RegistryPack, source: string, target: string): Promise<number> {
+    const limit = this.#maxExtractedBytes
+    let unpacked = 0
+    const counter = new Transform({
+      transform(chunk: Buffer, _encoding, done) {
+        unpacked += chunk.byteLength
+        if (unpacked > limit) {
+          done(
+            new Error(
+              `pack ${entry.name} unpacks to more than the ${sizeLabel(limit)} Peon Ping will ` +
+                'install, so the archive was not unpacked and nothing was kept. Ask the pack ' +
+                'author for a smaller archive, or install it with the peon-ping CLI.'
+            )
+          )
+          return
+        }
+        done(null, chunk)
+      }
+    })
+
+    await pipeline(createReadStream(source), createGunzip(), counter, createWriteStream(target))
+    return unpacked
+  }
+
   /** Extracts just the pack's subtree, with every entry path checked before tar writes it. */
-  async #extractPack(entry: RegistryPack, tarball: string, into: string): Promise<void> {
-    const listing = await runTar(['-tzf', tarball])
+  async #extractPack(entry: RegistryPack, archive: string, into: string): Promise<void> {
+    const listing = await runTar(['-tf', archive])
     const entryPaths = listing.split('\n').filter((line) => line.length > 0)
     for (const entryPath of entryPaths) {
       tarEntryTarget(into, entryPath)
@@ -350,7 +452,7 @@ export class PackInstaller {
     tarEntryTarget(into, member)
     const depth = member.split('/').length
     // `--` so a member name beginning with a dash is an operand and never an option to tar.
-    await runTar(['-xzf', tarball, '-C', into, '--strip-components', String(depth), '--', member])
+    await runTar(['-xf', archive, '-C', into, '--strip-components', String(depth), '--', member])
   }
 
   /**

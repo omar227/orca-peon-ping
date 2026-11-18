@@ -1,10 +1,13 @@
 import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import {
+  closeSync,
   existsSync,
+  ftruncateSync,
   linkSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readFileSync,
   readdirSync,
   rmSync,
@@ -17,9 +20,12 @@ import { afterEach, assert, beforeEach, test } from 'orca/testing'
 import {
   MAX_DOWNLOAD_BYTES,
   MAX_EXTRACTED_BYTES,
+  MAX_TAR_LISTING_BYTES,
   PackInstaller,
+  runTar,
   tarEntryTarget,
-  verifySoundFile
+  verifySoundFile,
+  writeFully
 } from './install.ts'
 import { packDir, packsRoot } from './paths.ts'
 import type { RegistryPack } from './registry.ts'
@@ -513,3 +519,154 @@ test('repeated previews reuse one temp directory instead of leaking one each', a
   assert.notEqual(first, second)
   assert.equal(readFileSync(second, 'utf8'), 'preview-audio')
 })
+
+/**
+ * A real gzip bomb, built here and never committed: a file of real zero bytes compresses about
+ * 1000:1, so the archive sails through the download cap. The decompression bound is what has to
+ * stop it — measuring the unpacked tree afterwards would be measuring a disk that is already
+ * full. `sparse: true` instead stores the file as a hole, which is a second way to ask tar to
+ * write far more than the archive contains, and which only the post-extract walk can see.
+ *
+ * The assertion that proves *where* each bound sits is the wording: the decompression check says
+ * "unpacks to more than the N", the post-extract backstop says "unpacks to <size>, more than".
+ * Only the first can be produced without tar having written the whole thing out first.
+ */
+function oversizedArchive(uncompressedBytes: number, options?: { sparse?: boolean }): Buffer {
+  const dir = scratchDir()
+  const root = join(dir, ARCHIVE_ROOT)
+  const sounds = join(root, 'peon', 'sounds')
+  mkdirSync(sounds, { recursive: true })
+  writeFileSync(join(root, 'peon', 'openpeon.json'), manifestJson('peon', '1.0.0', 'huge.wav'))
+
+  const fd = openSync(join(sounds, 'huge.wav'), 'w')
+  try {
+    if (options?.sparse === true) {
+      // A hole: tar stores it as one, so the archive itself stays small either way.
+      ftruncateSync(fd, uncompressedBytes)
+    } else {
+      const block = Buffer.alloc(1024 * 1024)
+      for (let written = 0; written < uncompressedBytes; written += block.byteLength) {
+        writeFileSync(fd, block)
+      }
+    }
+  } finally {
+    closeSync(fd)
+  }
+
+  const tarball = join(dir, 'bomb.tar.gz')
+  const result = spawnSync('tar', ['-czf', tarball, '-C', dir, ARCHIVE_ROOT], {
+    env: { ...process.env, COPYFILE_DISABLE: '1' }
+  })
+  if (result.status !== 0) {
+    throw new Error(`tar fixture failed: ${result.stderr?.toString() ?? ''}`)
+  }
+  return readFileSync(tarball)
+}
+
+test('a gzip bomb is refused while it is being decompressed, not after', async () => {
+  const bytes = oversizedArchive(256 * 1024 * 1024)
+  // Small enough to pass the download cap, which is exactly what makes it a bomb.
+  assert.ok(bytes.byteLength < MAX_DOWNLOAD_BYTES / 10, `the bomb is ${bytes.byteLength} bytes`)
+
+  const store = new Store(memoryStoreApi())
+  const installer = new PackInstaller(store, {
+    home: tmpHome,
+    fetchImpl: serving(bytes),
+    maxExtractedBytes: 8 * 1024 * 1024
+  })
+
+  await assert.rejects(() => installer.install(entry), /unpacks to more than the 8 MB/)
+
+  assert.equal(existsSync(packDir('peon', tmpHome)), false)
+  assert.deepEqual(await store.getInstalled(), {})
+  assert.deepEqual(packsRootEntries(), [])
+})
+
+/**
+ * The reason the post-extract walk stays: a sparse file is a handful of bytes in the archive and
+ * on the wire, so no byte counter upstream of tar can see it coming. Only what landed can.
+ */
+test('an archive of sparse files is refused by the post-extract backstop', async () => {
+  const bytes = oversizedArchive(400 * 1024 * 1024, { sparse: true })
+  const store = new Store(memoryStoreApi())
+  const installer = new PackInstaller(store, {
+    home: tmpHome,
+    fetchImpl: serving(bytes),
+    maxExtractedBytes: 8 * 1024 * 1024
+  })
+
+  await assert.rejects(() => installer.install(entry), /unpacks to 400 MB, more than the 8 MB/)
+
+  assert.equal(existsSync(packDir('peon', tmpHome)), false)
+  assert.deepEqual(await store.getInstalled(), {})
+  assert.deepEqual(packsRootEntries(), [])
+})
+
+test('an ordinary archive still installs through the decompression bound', async () => {
+  const installer = new PackInstaller(new Store(memoryStoreApi()), {
+    home: tmpHome,
+    fetchImpl: serving(packTarball())
+  })
+  await installer.install(entry)
+  assert.ok(existsSync(join(packDir('peon', tmpHome), 'sounds', 'hello.wav')))
+})
+
+/**
+ * The other way a large archive can take the worker down: the listing is read into one JS string
+ * so every path can be checked, so an archive of very many tiny entries is an OOM that never
+ * touches the download or extraction caps.
+ */
+test('a tar listing past the cap kills tar instead of growing a string', async () => {
+  const dir = scratchDir()
+  const root = join(dir, ARCHIVE_ROOT)
+  mkdirSync(root, { recursive: true })
+  for (let i = 0; i < 50; i++) writeFileSync(join(root, `entry-${i}.wav`), 'x')
+  const archive = join(dir, 'many.tar')
+  const built = spawnSync('tar', ['-cf', archive, '-C', dir, ARCHIVE_ROOT], {
+    env: { ...process.env, COPYFILE_DISABLE: '1' }
+  })
+  assert.equal(built.status, 0)
+
+  await assert.rejects(() => runTar(['-tf', archive], { maxStdoutBytes: 64 }), /file names/)
+  // The same listing is fine under the real cap.
+  const listing = await runTar(['-tf', archive])
+  assert.ok(listing.split('\n').filter((line) => line.length > 0).length > 50)
+  assert.equal(MAX_TAR_LISTING_BYTES, 16 * 1024 * 1024)
+})
+
+test('writeFully loops until the whole chunk has landed', () => {
+  const calls: number[] = []
+  const written: number[] = []
+  const shortWriter = (_fd: number, bytes: Uint8Array, offset: number, length: number): number => {
+    // As a real short write does: fewer bytes than asked for.
+    const n = Math.min(3, length)
+    calls.push(n)
+    for (let i = 0; i < n; i++) written.push(bytes[offset + i])
+    return n
+  }
+
+  writeFully(1, Uint8Array.from([1, 2, 3, 4, 5, 6, 7, 8]), shortWriter)
+
+  assert.deepEqual(written, [1, 2, 3, 4, 5, 6, 7, 8])
+  assert.deepEqual(calls, [3, 3, 2])
+})
+
+test('writeFully gives up rather than spinning when nothing can be written', () => {
+  assert.throws(
+    () => writeFully(1, Uint8Array.from([1, 2, 3]), () => 0),
+    /could not write the pack archive/
+  )
+})
+
+test('writeFully writes a real file whole', () => {
+  const file = join(tmpHome, 'whole.bin')
+  const bytes = Buffer.alloc(1024 * 1024, 7)
+  const fd = openSync(file, 'w')
+  try {
+    writeFully(fd, bytes)
+  } finally {
+    closeSync(fd)
+  }
+  assert.deepEqual(readFileSync(file), bytes)
+})
+
