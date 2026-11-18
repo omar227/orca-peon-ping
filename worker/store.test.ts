@@ -45,3 +45,19 @@ test('firstRunDone starts false and latches', async () => {
   await store.markFirstRunDone()
   assert.equal(await store.isFirstRunDone(), true)
 })
+
+test('a corrupted installedPacks value reads back as empty rather than throwing', async () => {
+  const api = memoryStoreApi()
+  await api.set('installedPacks', 'not an object')
+  const store = new Store(api)
+  assert.deepEqual(await store.getInstalled(), {})
+  await store.recordInstalled({
+    name: 'peon',
+    version: '1.0.0',
+    sourceRef: 'v1.0.0',
+    manifestSha256: null,
+    installedAt: 1,
+    adopted: false
+  })
+  assert.deepEqual(Object.keys(await store.getInstalled()), ['peon'])
+})

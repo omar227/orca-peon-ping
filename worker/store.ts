@@ -41,7 +41,11 @@ export class Store {
   }
 
   async getInstalled(): Promise<Record<string, InstalledPack>> {
-    return (await this.#api.get<Record<string, InstalledPack>>(KEYS.installedPacks)) ?? {}
+    const value = await this.#api.get<Record<string, InstalledPack>>(KEYS.installedPacks)
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+      return {}
+    }
+    return value
   }
 
   async recordInstalled(pack: InstalledPack): Promise<void> {
