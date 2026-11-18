@@ -21,10 +21,10 @@ whether to go look.
 
 ## Install
 
-1. In Orca, open the plugin browser and install **Peon Ping** (`omar227.peon-ping`), or
+1. In Orca, open the plugin browser and install **Peon Ping** (`omar227.peonping`), or
    from a terminal:
    ```bash
-   orca plugin install omar227.peon-ping
+   orca plugin install omar227.peonping
    ```
    (or, before it's in the catalog, `orca plugin install omar227/orca-peon-ping`).
 2. Approve the access it asks for when prompted — see [Access requested](#access-requested)

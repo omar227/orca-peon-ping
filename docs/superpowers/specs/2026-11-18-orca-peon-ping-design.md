@@ -2,7 +2,7 @@
 
 Status: approved design, not yet built. v1.0 is macOS-only; see *Later, not now*.
 Date: 2026-11-18
-Owner: omar227 (GitHub), published as `omar227.peon-ping`
+Owner: omar227 (GitHub), published as `omar227.peonping`
 
 ## Intent and why
 
@@ -443,3 +443,26 @@ should not reach into Orca's notification preferences.
 - The exact windowing approach for 382 rows.
 - Module layout within `worker/`.
 - Whether registry refresh is lazy-on-open or also on a timer.
+
+## Correction — 2026-11-18, plugin id changed to `peonping`
+
+The plugin was first published from `omar227/orca-peon-ping` with the id
+`peon-ping`. That repository was then deleted and recreated under the same name
+in order to scrub commit authorship carrying a work email address.
+
+Orca's directory binds a **plugin id to a numeric GitHub repository id**, not to
+a repository name. The recreated repository has a new numeric id, so the
+directory reported "This plugin id is already tied to another GitHub
+repository" and `omar227.peon-ping` can never be published again — from this
+repository or any other. v1.0.0 was never actually listed.
+
+The id is therefore `peonping`, published from the same repository. Install key:
+`omar227.peonping`.
+
+Two lessons, both learned the expensive way:
+
+1. Scrub commit authorship **before** the first publication. Pin
+   `user.email` per-repository at `git init` time; a global work identity will
+   otherwise be inherited by every commit, including those made by tooling.
+2. A plugin id is spent the moment it is listed against a repository id.
+   Deleting the repository does not free it.

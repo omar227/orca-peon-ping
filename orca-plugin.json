@@ -2,7 +2,7 @@
   "$schema": "https://raw.githubusercontent.com/stablyai/orca/main/docs/schemas/plugins/orca-plugin.v2.schema.json",
   "manifestVersion": 2,
   "execution": "trusted-worker",
-  "id": "peon-ping",
+  "id": "peonping",
   "name": "Peon Ping",
   "version": "1.0.0",
   "description": "Character voice lines when your agents finish, fail, or need you. 380+ sound packs from the OpenPeon registry. macOS only in this version.",
