@@ -88,6 +88,12 @@ export class PaneTracker {
     // outcome is undefined throughout and the state really does change each time, and an agent
     // still waiting on a human is exactly what this plugin exists to keep saying. A burst inside
     // 500 ms collapses to one sound at the per-category gate.
+    //
+    // The trade this key makes, stated plainly: `done`+`success` followed by a bare `done` for
+    // the same pane is two distinct reports, so `task.complete` plays twice. That is the right
+    // side to err on — an absent outcome is common, not exceptional, and treating it as a repeat
+    // would mean a finished agent that reports it that way goes silent, which is failure mode
+    // number one. A doubled completion inside 500 ms is swallowed by the gate anyway.
     if (prior && prior.state === event.state && prior.outcome === event.mainAgent?.outcome) {
       return null
     }
