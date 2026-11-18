@@ -199,13 +199,24 @@ function archiveRootOf(entryPaths: readonly string[]): string {
   return root
 }
 
+/**
+ * Where the pack sits inside the tag archive, as a path relative to the archive's single root
+ * directory — or `''` when the pack *is* the repository root.
+ *
+ * `source_path: "."` is not an edge case: **214 of the registry's 382 entries use it**, which is
+ * every pack that lives in a repository of its own. It used to come back as the literal `.`, so
+ * the tar member was `root/.` and `--strip-components` was computed as 2, which stripped
+ * `openpeon.json` out of existence and failed the install with "has no openpeon.json". The
+ * default `peon` pack is in a shared repository with `source_path: "peon"`, which is why first
+ * run worked and this never showed up.
+ */
 function sourcePathOf(entry: RegistryPack): string {
   const raw = entry.source_path ?? entry.name
   const trimmed = raw.replace(/^\/+|\/+$/g, '')
   if (trimmed.length === 0) {
     throw new Error(`registry entry ${entry.name} has an empty source_path`)
   }
-  return trimmed
+  return trimmed === '.' ? '' : trimmed
 }
 
 /**
@@ -448,7 +459,9 @@ export class PackInstaller {
       tarEntryTarget(into, entryPath)
     }
 
-    const member = `${archiveRootOf(entryPaths)}/${sourcePathOf(entry)}`
+    const subtree = sourcePathOf(entry)
+    const archiveRoot = archiveRootOf(entryPaths)
+    const member = subtree === '' ? archiveRoot : `${archiveRoot}/${subtree}`
     tarEntryTarget(into, member)
     const depth = member.split('/').length
     // `--` so a member name beginning with a dash is an operand and never an option to tar.
@@ -516,7 +529,9 @@ export class PackInstaller {
     const root = this.packDir(entry.name)
     const relativePath = relative(root, resolveSoundPath(root, file)).split(sep).join('/')
 
-    const url = `https://raw.githubusercontent.com/${entry.source_repo}/${entry.source_ref}/${sourcePathOf(entry)}/${relativePath}`
+    const subtree = sourcePathOf(entry)
+    const prefix = subtree === '' ? '' : `${subtree}/`
+    const url = `https://raw.githubusercontent.com/${entry.source_repo}/${entry.source_ref}/${prefix}${relativePath}`
     const response = await this.#fetchImpl(url)
     if (!response.ok) {
       throw new Error(`preview download failed with ${response.status}: ${url}`)

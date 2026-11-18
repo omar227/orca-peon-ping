@@ -670,3 +670,46 @@ test('writeFully writes a real file whole', () => {
   assert.deepEqual(readFileSync(file), bytes)
 })
 
+/**
+ * `source_path: "."` — the pack *is* the repository — is what 214 of the registry's 382 entries
+ * say, every pack that lives in a repository of its own. It used to make the tar member `root/.`
+ * and strip two components, which deleted `openpeon.json` on the way out and failed every one of
+ * those installs with "has no openpeon.json". Verified against three real packs from GitHub
+ * (`minecraft_villager`, `cc_commando`, `claptrap-fr`); this is the committed version.
+ */
+test('a pack whose source_path is "." installs from the archive root', async () => {
+  const bytes = buildTarball((root) => {
+    mkdirSync(join(root, 'sounds'), { recursive: true })
+    writeFileSync(join(root, 'openpeon.json'), manifestJson('villager', '1.0.1', 'hello.wav'))
+    writeFileSync(join(root, 'sounds', 'hello.wav'), 'fake-audio')
+    writeFileSync(join(root, 'README.md'), '# a pack in a repository of its own')
+  })
+  const store = new Store(memoryStoreApi())
+  const installer = new PackInstaller(store, { home: tmpHome, fetchImpl: serving(bytes) })
+
+  await installer.install({ ...entry, name: 'villager', source_path: '.' })
+
+  const dir = packDir('villager', tmpHome)
+  assert.ok(existsSync(join(dir, 'openpeon.json')))
+  assert.ok(existsSync(join(dir, 'sounds', 'hello.wav')))
+  assert.deepEqual(packsRootEntries(), ['villager'])
+})
+
+test('a preview for a root-level pack does not put a "." in its URL', async () => {
+  const urls: string[] = []
+  const installer = new PackInstaller(new Store(memoryStoreApi()), {
+    home: tmpHome,
+    fetchImpl: (async (url: string) => {
+      urls.push(String(url))
+      return new Response('preview-audio')
+    }) as unknown as typeof fetch
+  })
+
+  const path = await installer.downloadPreview(
+    { ...entry, name: 'villager', source_repo: 'a/b', source_ref: 'v1.0.1', source_path: '.' },
+    'villager_idle1.ogg'
+  )
+  scratch.push(dirname(path))
+
+  assert.equal(urls[0], 'https://raw.githubusercontent.com/a/b/v1.0.1/sounds/villager_idle1.ogg')
+})
