@@ -105,6 +105,11 @@ requests only to `github.com` (pack downloads), `raw.githubusercontent.com` (pre
 sounds, fetched one file at a time before you install a pack), and `peonping.github.io`
 (the registry index). No telemetry, no analytics, no terminal reading.
 
+Packs live in `~/.openpeon/packs/`, shared with the peon-ping CLI, and the registry index
+is cached beside them in `~/.openpeon/registry-cache.json` — it is ~540 KB, twice what one
+Orca plugin-storage value may hold, so it is a file rather than stored data. Deleting it
+costs one refresh and nothing else.
+
 ## Credit
 
 This plugin is an independent implementation of CESP, the Coding Event Sound Pack

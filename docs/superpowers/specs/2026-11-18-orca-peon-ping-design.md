@@ -212,9 +212,20 @@ Packs live in `~/.openpeon/packs/<name>/`, the same path peon-ping uses, so the 
 coexist and share a cache if both are installed.
 
 Registry index: `https://peonping.github.io/registry/index.json` (~540 KB, 382 entries).
-Cache it in `storage:own` with a timestamp; refresh on panel open if older than 24 hours,
-and on explicit refresh. Serve the cached copy immediately so the panel never blocks on
-the network.
+Cache it with a timestamp; refresh on panel open if older than 24 hours, and on explicit
+refresh. Serve the cached copy immediately so the panel never blocks on the network.
+
+> **Correction (2026-11-18, found by running against the real registry).** This section
+> originally said to cache the index in `storage:own`. That cannot work: Orca caps one
+> stored value at `PLUGIN_STORAGE_VALUE_MAX_BYTES` = 256 KiB
+> (`out/shared/plugins/workers/plugin-host-api-storage-schemas.js`), and the index is
+> ~540 KB — so `storage.set` rejected it and the rejection escaped `RegistryClient.load()`,
+> failing `packs.list` outright. The cache is a file instead:
+> `~/.openpeon/registry-cache.json`, same `{ fetchedAt, index }` shape, written atomically
+> (temp file then rename), with a corrupt file treated exactly like a missing one. `load()`
+> may not throw for any reason — not for a failed read, a failed write, or anything else.
+> The same 256 KiB cap applies to one `panels.post`, so the `packs.changed` push measures
+> its payload and skips rather than letting Orca's rejection fail the mutation behind it.
 
 To install pack `<name>` from its registry entry:
 
