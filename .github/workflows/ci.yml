@@ -1,0 +1,73 @@
+# CI does NOT validate this plugin, and does NOT check its TypeScript.
+#
+# Orca is not installed on GitHub-hosted runners, so this workflow cannot run
+# `orca plugin validate .`, `orca plugin test .`, or `orca plugin check .` — the
+# commands that actually prove the manifest is well-formed, the panel renders, and
+# the plugin's tests pass. A green check here is NOT evidence that the plugin
+# works in Orca.
+#
+# Those commands run locally, where Orca is installed, and are the project's
+# pre-tag checklist — see the "Pre-tag checklist" section of README.md. Run them,
+# and confirm by ear in a real Orca session, before tagging a release.
+#
+# Why there is no TypeScript syntax-check step here, even a lightweight one:
+#
+# 1. Every worker/*.test.ts and src/panel.test.tsx file imports `test`/`assert`/etc.
+#    from `orca/testing`, which only resolves inside Orca's plugin runtime. There
+#    is no dependency-free test file in this repo, so `node --test` cannot run
+#    anything standalone.
+# 2. An earlier version of this workflow substituted `node --check` (via
+#    `--experimental-strip-types`) as a syntax-only parse pass. That was verified,
+#    empirically, to be a no-op: `node --check` only does its syntax parse for
+#    CommonJS-format sources, and every `.ts` file in this repo is ESM
+#    (`import`/`export`). Copying worker/mapping.ts, injecting a real unbalanced
+#    parenthesis into a live statement, and running the exact check command against
+#    it returns exit 0 — the step was green regardless of file content.
+# 3. The alternative — actually importing each file with
+#    `node --experimental-strip-types` so real parsing happens — is not an honest
+#    substitute either: Node's type-stripping only erases type syntax, it does not
+#    transform TypeScript, so it rejects constructor parameter properties (for
+#    example `worker/player.ts`'s `constructor(private readonly spawn: SpawnFn)`).
+#    That file is correct — `orca plugin test .` passes it — but a bare Node 22
+#    runtime cannot load it at all. That check would fail on known-good code, not
+#    just on real bugs, which is worse than running nothing.
+# 4. A real TypeScript check (tsc, or anything stricter than Node's own erasable-
+#    syntax stripping) would mean installing a TypeScript toolchain, and this repo
+#    intentionally ships with no `package.json` and no dependencies of any kind.
+#
+# So this job does exactly one thing, and it is real: it checks that
+# `orca-plugin.json` parses as JSON and has the shape the plugin loader requires.
+# Nothing here reads or executes the TypeScript sources.
+
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  manifest-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Sanity-check orca-plugin.json
+        run: |
+          node --eval "
+            const fs = require('node:fs');
+            const manifest = JSON.parse(fs.readFileSync('orca-plugin.json', 'utf8'));
+            const requiredStrings = ['id', 'name', 'version', 'license', 'main'];
+            const missing = requiredStrings.filter((key) => typeof manifest[key] !== 'string' || manifest[key].length === 0);
+            if (manifest.manifestVersion !== 2) missing.push('manifestVersion (expected 2)');
+            if (!Array.isArray(manifest.capabilities) || manifest.capabilities.length === 0) missing.push('capabilities (non-empty array)');
+            if (!manifest.contributes || typeof manifest.contributes !== 'object') missing.push('contributes (object)');
+            if (missing.length > 0) {
+              console.error('orca-plugin.json is missing or malformed: ' + missing.join(', '));
+              process.exit(1);
+            }
+            console.log('orca-plugin.json parses and has the expected top-level shape.');
+          "

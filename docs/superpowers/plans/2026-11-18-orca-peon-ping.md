@@ -1305,7 +1305,7 @@ git commit -m "docs: README and CI, verified by ear in Orca"
 - [ ] **Step 1: Confirm the credential**
 
 Run: `gh auth status`
-Expected: an entry for `omar227`. If it shows only `omar227`, stop and ask the user to run `gh auth login`. The repository owner must be `omar227` or Orca will reject the publisher.
+Expected: an entry for `omar227`. If that account is not the one `gh` is signed in as, stop and ask the user to run `gh auth login`. The repository owner must be `omar227` or Orca will reject the publisher.
 
 - [ ] **Step 2: Final validation**
 

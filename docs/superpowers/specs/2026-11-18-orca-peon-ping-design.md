@@ -212,9 +212,20 @@ Packs live in `~/.openpeon/packs/<name>/`, the same path peon-ping uses, so the 
 coexist and share a cache if both are installed.
 
 Registry index: `https://peonping.github.io/registry/index.json` (~540 KB, 382 entries).
-Cache it in `storage:own` with a timestamp; refresh on panel open if older than 24 hours,
-and on explicit refresh. Serve the cached copy immediately so the panel never blocks on
-the network.
+Cache it with a timestamp; refresh on panel open if older than 24 hours, and on explicit
+refresh. Serve the cached copy immediately so the panel never blocks on the network.
+
+> **Correction (2026-11-18, found by running against the real registry).** This section
+> originally said to cache the index in `storage:own`. That cannot work: Orca caps one
+> stored value at `PLUGIN_STORAGE_VALUE_MAX_BYTES` = 256 KiB
+> (`out/shared/plugins/workers/plugin-host-api-storage-schemas.js`), and the index is
+> ~540 KB — so `storage.set` rejected it and the rejection escaped `RegistryClient.load()`,
+> failing `packs.list` outright. The cache is a file instead:
+> `~/.openpeon/registry-cache.json`, same `{ fetchedAt, index }` shape, written atomically
+> (temp file then rename), with a corrupt file treated exactly like a missing one. `load()`
+> may not throw for any reason — not for a failed read, a failed write, or anything else.
+> The same 256 KiB cap applies to one `panels.post`, so the `packs.changed` push measures
+> its payload and skips rather than letting Orca's rejection fail the mutation behind it.
 
 To install pack `<name>` from its registry entry:
 
@@ -241,10 +252,13 @@ the first time after install; a mismatch means skip that sound, not fail the pac
 deliberately shared, so the plugin must not behave as though it owns it. If a pack
 directory already exists and its `openpeon.json` parses, adopt it as-is and mark it
 *adopted* — no overwrite, no hash enforcement against the registry, since peon-ping may
-have put a different version there legitimately. An adopted pack still offers Update,
-which replaces it with the registry version. **Delete** is offered only for packs this
-plugin recorded installing; adopted packs show no Delete, so the plugin can never remove
-something peon-ping is relying on.
+have put a different version there legitimately. An adopted pack offers **neither** Update
+nor Delete: updating one means deleting the directory peon-ping put there, which is the one
+thing adoption promises not to do, so `install()` refuses an adopted pack outright. (This
+paragraph originally said an adopted pack still offers Update. The code is right and the
+document was wrong; corrected 2026-11-18.) **Delete** is likewise offered only for packs
+this plugin recorded installing, so the plugin can never remove something peon-ping is
+relying on.
 
 **Preview before install** fetches just the one file from
 `https://raw.githubusercontent.com/{source_repo}/{source_ref}/{source_path}/{file}` into
@@ -253,7 +267,16 @@ a temp path and plays it. `preview_sounds[]` in the registry entry names good ca
 button press — if someone clicks play, they want to hear it.
 
 **First run:** if no pack is installed and none has ever been chosen, install `peon`
-(Warcraft III Orc Peon, ~2 MB, the namesake) and make it active.
+(Warcraft III Orc Peon, the namesake) and make it active.
+
+> **Correction (2026-11-18, measured against the real host).** "~2 MB" was the pack's own
+> size, not the download. `peon` lives in the 43-pack `PeonPing/og-packs` repository and
+> GitHub only serves whole-tag archives, so installing an 872 KB pack really transfers
+> **58,299,881 bytes — 56 MB** (at `v1.0.0`, the tag the registry pins; that repo's `v1.1.0`
+> is 62,009,213 bytes). Two consequences the builder must take seriously: the first-run
+> install cannot be on the path the panel waits for, and the download needs a byte cap that
+> clears 56 MB — `codeload.github.com` sends no `Content-Length`, so counting as the bytes
+> arrive is the only way to have one.
 
 *Builder's call on "once":* the flag that stops this from recurring is set on a
 **successful** install, not an attempt. A fresh machine that is offline or behind a proxy
@@ -390,10 +413,8 @@ over unit coverage.
 4. `gh repo edit omar227/orca-peon-ping --add-topic orca-plugin`.
 5. Listing appears at `https://orca.dev/plugins/omar227/orca-peon-ping` within ~1 hour.
 
-**Credential note:** `gh` on this machine is authenticated as `omar227`, a work account.
-Orca requires `publisher` to equal the repository owner, so every step above must run as
-`omar227`. The owner adds that account with `gh auth login` when the build reaches this
-point.
+Orca requires `publisher` to equal the repository owner, so every step above has to run as
+`omar227`.
 
 Optionally, submit to the OpenPeon ecosystem as a CESP implementation, and to Orca's
 community catalog via `orca plugin release-entry`.
