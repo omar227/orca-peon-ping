@@ -33,6 +33,14 @@ const DEFAULT_PACK = 'peon'
 /** Hundreds of packs, and `List` does not virtualise: the sidebar draws a slice of them. */
 const MAX_ROWS = 60
 
+/**
+ * An install is a download — 56 MB for the default pack, because GitHub only serves whole-tag
+ * archives — and `plugin.request` defaults to 30 s, which is how the first install on a fresh
+ * machine came back as `timeout`. 120 s is the most Orca allows. A forced registry refresh waits
+ * on the network too, so it gets the same; an ordinary list does not wait for anything.
+ */
+const SLOW_REQUEST_TIMEOUT_MS = 120_000
+
 const TIER_OPTIONS = [
   { value: 'all', label: 'All' },
   { value: 'installed', label: 'Installed' },
@@ -62,7 +70,8 @@ export function setup(ctx: PanelContext): void {
 
 async function refresh(force = false): Promise<void> {
   try {
-    set(packs, await plugin.request('packs.list', { force }))
+    const options = force ? { timeoutMs: SLOW_REQUEST_TIMEOUT_MS } : undefined
+    set(packs, await plugin.request('packs.list', { force }, options))
     set(notice, null)
   } catch (error) {
     set(notice, messageOf(error))
@@ -76,7 +85,9 @@ async function act(
 ): Promise<void> {
   set(notice, null)
   try {
-    await plugin.request(request, { name })
+    const options =
+      request === 'packs.install' ? { timeoutMs: SLOW_REQUEST_TIMEOUT_MS } : undefined
+    await plugin.request(request, { name }, options)
   } catch (error) {
     set(notice, messageOf(error))
     return
@@ -137,7 +148,7 @@ export default function Panel() {
       ) : (
         <Stack gap="xs">
           <Text muted size="xs">
-            Showing {shown.length} of {matching.length}
+            {showingLabel(shown.length, matching.length, view.rows.length)}
           </Text>
           <List label="Packs">
             {shown.map((row) => (
@@ -231,14 +242,14 @@ function PackRow({ row, canPlay }: { row: PackRowView; canPlay: boolean }) {
           </Text>
         </Row>
         {row.busy ? (
-          <Spinner label={`Working on ${row.displayName}`} />
+          <Spinner label={busyLabel(row)} />
         ) : (
           <Row gap="xs" align="center" wrap>
             <IconButton
               icon="play"
               label={`Preview ${row.displayName}`}
               variant="ghost"
-              disabled={!canPlay}
+              disabled={!canPlay || !row.canPreview}
               onPress={() => void act('packs.preview', row.name)}
             />
             {row.present ? null : (
@@ -295,6 +306,22 @@ function tierTone(trustTier: string): Tone {
   if (trustTier === 'official') return 'accent'
   if (trustTier === 'verified') return 'success'
   return 'neutral'
+}
+
+/** A filtered list must still say how big the catalogue is: "Showing 6 of 6" hid 382 packs. */
+function showingLabel(shown: number, matching: number, total: number): string {
+  if (matching === total) return `Showing ${shown} of ${total} packs`
+  return `Showing ${shown} of ${matching} matches · ${total} packs`
+}
+
+/**
+ * Progress is the bytes downloaded, with nothing to divide by: `sizeBytes` is the pack's own
+ * size, while the download is the whole tag archive the pack lives in — 56 MB of repository for
+ * an 872 KB `peon`. A percentage made of those two numbers would be a lie.
+ */
+function busyLabel(row: PackRowView): string {
+  if (row.progressBytes === null) return `Working on ${row.displayName}`
+  return `Downloading ${row.displayName} — ${formatSize(row.progressBytes)}`
 }
 
 /** The one line of metadata a 340px row has space for. */

@@ -1,9 +1,17 @@
 import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
-import { registryCachePath } from './paths.ts'
+import { PACK_NAME_PATTERN, registryCachePath } from './paths.ts'
 
 export const REGISTRY_URL = 'https://peonping.github.io/registry/index.json'
 export const REGISTRY_TTL_MS = 86_400_000
+
+/**
+ * How long to leave an unreachable registry alone after a background refresh failed. A failed
+ * refresh leaves the cache out of date, so the next `load()` would start another one — and every
+ * `packs.changed` push calls `load()`, so without this the push and the refresh spin on each
+ * other for as long as the network is down.
+ */
+export const BACKGROUND_RETRY_MS = 300_000
 
 export type RegistryPack = {
   name: string
@@ -29,7 +37,87 @@ export type RegistryIndex = { version: number; packs: RegistryPack[] }
 
 export type RegistryCache = { fetchedAt: number; index: RegistryIndex }
 
-function asRegistryIndex(parsed: unknown): RegistryIndex {
+function nonEmptyString(value: unknown): string | null {
+  return typeof value === 'string' && value.trim().length > 0 ? value : null
+}
+
+/**
+ * `preview_sounds` is not one shape in the live registry. 339 packs ship `string[]`, 40 ship
+ * nothing usable, and three — `itysl`, `solid_snake` and `speaki` — ship `[{file, label}]`.
+ * Those three used to throw a raw `ERR_INVALID_ARG_TYPE` out of the preview button.
+ */
+function previewSoundsOf(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined
+  const files: string[] = []
+  for (const item of value) {
+    const direct = nonEmptyString(item)
+    if (direct !== null) {
+      files.push(direct)
+      continue
+    }
+    if (typeof item === 'object' && item !== null) {
+      const file = nonEmptyString((item as { file?: unknown }).file)
+      if (file !== null) files.push(file)
+    }
+  }
+  return files.length > 0 ? files : undefined
+}
+
+/**
+ * One registry row, checked for the fields this plugin actually dereferences and left alone
+ * everywhere else. A row that fails returns null and is dropped: the whole point of fetching the
+ * registry at runtime is that new entries arrive without a plugin release, so one malformed row
+ * — one `name` that `packDir` would refuse, say — may cost that row and nothing more. It used to
+ * cost every user the entire pack list until the registry was fixed.
+ */
+function toRegistryPack(value: unknown): RegistryPack | null {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return null
+  const row = value as Record<string, unknown>
+
+  const name = typeof row.name === 'string' && PACK_NAME_PATTERN.test(row.name) ? row.name : null
+  const displayName = nonEmptyString(row.display_name)
+  const version = nonEmptyString(row.version)
+  const sourceRepo = nonEmptyString(row.source_repo)
+  const sourceRef = nonEmptyString(row.source_ref)
+  // Tolerated as whatever string the registry uses: an unknown tier should show up as a plain
+  // badge, not delete the pack from everyone's list the day the registry adds one.
+  const trustTier = nonEmptyString(row.trust_tier)
+  const soundCount = typeof row.sound_count === 'number' && Number.isFinite(row.sound_count)
+
+  if (
+    name === null ||
+    displayName === null ||
+    version === null ||
+    sourceRepo === null ||
+    sourceRef === null ||
+    trustTier === null ||
+    !soundCount
+  ) {
+    return null
+  }
+  // Both go straight into a URL path, so neither may carry a separator or whitespace of its own.
+  if (!/^[^\s/]+\/[^\s/]+$/.test(sourceRepo) || /\s/.test(sourceRef)) return null
+
+  return {
+    ...row,
+    name,
+    display_name: displayName,
+    version,
+    trust_tier: trustTier as RegistryPack['trust_tier'],
+    sound_count: row.sound_count as number,
+    source_repo: sourceRepo,
+    source_ref: sourceRef,
+    description: nonEmptyString(row.description) ?? undefined,
+    source_path: nonEmptyString(row.source_path) ?? undefined,
+    total_size_bytes:
+      typeof row.total_size_bytes === 'number' && Number.isFinite(row.total_size_bytes)
+        ? row.total_size_bytes
+        : undefined,
+    preview_sounds: previewSoundsOf(row.preview_sounds)
+  }
+}
+
+function asRegistryIndex(parsed: unknown, log: (message: string) => void): RegistryIndex {
   if (typeof parsed !== 'object' || parsed === null) {
     throw new Error('registry index must be a JSON object')
   }
@@ -42,17 +130,30 @@ function asRegistryIndex(parsed: unknown): RegistryIndex {
     throw new Error(`registry index has unsupported version: ${String(index.version)}`)
   }
 
-  return index as RegistryIndex
+  const packs: RegistryPack[] = []
+  for (const row of index.packs) {
+    const pack = toRegistryPack(row)
+    if (pack !== null) packs.push(pack)
+  }
+  const dropped = index.packs.length - packs.length
+  if (dropped > 0) {
+    log(`ignored ${dropped} of ${index.packs.length} registry entries the plugin cannot use`)
+  }
+
+  return { version: 1, packs }
 }
 
-export function parseRegistryIndex(text: string): RegistryIndex {
+export function parseRegistryIndex(
+  text: string,
+  log: (message: string) => void = () => {}
+): RegistryIndex {
   let parsed: unknown
   try {
     parsed = JSON.parse(text)
   } catch {
     throw new Error('registry index is not valid JSON')
   }
-  return asRegistryIndex(parsed)
+  return asRegistryIndex(parsed, log)
 }
 
 /**
@@ -84,7 +185,7 @@ function parseRegistryCache(text: string): RegistryCache {
   if (typeof cache.fetchedAt !== 'number' || !Number.isFinite(cache.fetchedAt)) {
     throw new Error('registry cache has no fetch timestamp')
   }
-  return { fetchedAt: cache.fetchedAt, index: asRegistryIndex(cache.index) }
+  return { fetchedAt: cache.fetchedAt, index: asRegistryIndex(cache.index, () => {}) }
 }
 
 /**
@@ -135,6 +236,8 @@ export type RegistryClientOptions = {
   /** Overrides the on-disk cache, for tests that need reads or writes to fail. */
   cache?: RegistryCacheIo
   log?: (message: string) => void
+  /** Called when a refresh running behind the panel has landed. */
+  onRefreshed?: () => void
 }
 
 export class RegistryClient {
@@ -142,12 +245,21 @@ export class RegistryClient {
   readonly #now: () => number
   readonly #cache: RegistryCacheIo
   readonly #log: (message: string) => void
+  /**
+   * Set by the worker once it exists, so a refresh that lands behind the panel can push the
+   * new list rather than waiting for the panel to ask again.
+   */
+  onRefreshed: (() => void) | null
+  #inFlight: Promise<void> | null = null
+  #lastAttemptAt = Number.NEGATIVE_INFINITY
+  #lastError: string | null = null
 
   constructor(options?: RegistryClientOptions) {
     this.#fetchImpl = options?.fetchImpl ?? fetch
     this.#now = options?.now ?? Date.now
     this.#cache = options?.cache ?? fileRegistryCache(options?.home)
     this.#log = options?.log ?? (() => {})
+    this.onRefreshed = options?.onRefreshed ?? null
   }
 
   /**
@@ -155,31 +267,74 @@ export class RegistryClient {
    * own JSON, reading the cache, writing the cache — degrades to a result, because the
    * callers are the pack list and the panel push: a throw here is a user who sees no packs
    * and hears no sounds, which is the one failure this plugin exists to avoid.
+   *
+   * It also never *waits* on the network when it has something to show. The design says it in
+   * so many words — "Serve the cached copy immediately so the panel never blocks on the
+   * network" — and a panel that waited for a 540 KB refresh is how the first open after a day
+   * away became a `timeout` error screen. A cache past its TTL is served as it is and refreshed
+   * behind the panel; `onRefreshed` pushes the result when it lands.
    */
   async load(options?: { force?: boolean }): Promise<RegistryResult> {
     const cached = this.#readCache()
-    try {
-      return await this.#refresh(cached, options?.force === true)
-    } catch (error) {
-      // Nothing below is expected to throw; if something does, the cache still answers.
-      this.#log(`registry load failed unexpectedly: ${messageOf(error)}`)
-      return {
-        index: cached?.index ?? null,
-        fetchedAt: cached?.fetchedAt ?? null,
-        stale: cached !== null,
-        error: messageOf(error)
-      }
+
+    // Nothing to show, or the person pressed Refresh and is waiting for an answer.
+    if (cached === null || options?.force === true) {
+      return await this.#attempt(cached)
+    }
+
+    if (this.#now() - cached.fetchedAt >= REGISTRY_TTL_MS) this.#refreshInBackground()
+
+    return {
+      index: cached.index,
+      fetchedAt: cached.fetchedAt,
+      // Merely out of date is not `stale` to the panel: `stale` is "the worker tried and could
+      // not", which is what the panel's "Showing the last pack list" warning means.
+      stale: this.#lastError !== null,
+      error: this.#lastError
     }
   }
 
-  async #refresh(cached: RegistryCache | null, force: boolean): Promise<RegistryResult> {
-    const now = this.#now()
-    const isFresh = cached !== null && now - cached.fetchedAt < REGISTRY_TTL_MS
+  /** Resolves once any refresh running behind the panel has finished. */
+  async settled(): Promise<void> {
+    while (this.#inFlight !== null) await this.#inFlight
+  }
 
-    if (isFresh && !force) {
-      return { index: cached.index, fetchedAt: cached.fetchedAt, stale: false, error: null }
+  /** One refresh at a time, and not again straight away when the last one failed. */
+  #refreshInBackground(): void {
+    if (this.#inFlight !== null) return
+    if (this.#now() - this.#lastAttemptAt < BACKGROUND_RETRY_MS) return
+
+    this.#inFlight = (async () => {
+      try {
+        await this.#attempt(this.#readCache())
+      } finally {
+        this.#inFlight = null
+      }
+      try {
+        this.onRefreshed?.()
+      } catch (error) {
+        this.#log(`could not announce a refreshed registry: ${messageOf(error)}`)
+      }
+    })()
+  }
+
+  /** One fetch attempt, whatever happens. Records why it failed, and never throws. */
+  async #attempt(cached: RegistryCache | null): Promise<RegistryResult> {
+    this.#lastAttemptAt = this.#now()
+    let result: RegistryResult
+    try {
+      result = await this.#refresh(cached)
+    } catch (error) {
+      // Nothing below is expected to throw; if something does, the cache still answers.
+      this.#log(`registry load failed unexpectedly: ${messageOf(error)}`)
+      result = this.#fallback(cached, messageOf(error))
     }
+    this.#lastError = result.error
+    return result
+  }
 
+  async #refresh(cached: RegistryCache | null): Promise<RegistryResult> {
+    const now = this.#now()
     let response: Response
     try {
       response = await this.#fetchImpl(REGISTRY_URL)
@@ -194,7 +349,7 @@ export class RegistryClient {
     let index: RegistryIndex
     try {
       const text = await response.text()
-      index = parseRegistryIndex(text)
+      index = parseRegistryIndex(text, this.#log)
     } catch (err) {
       return this.#fallback(cached, messageOf(err))
     }

@@ -15,6 +15,8 @@ const peonRow = (over: Partial<PackRowView> = {}): PackRowView => ({
   updateAvailable: false,
   removable: true,
   busy: false,
+  canPreview: true,
+  progressBytes: null,
   ...over
 })
 
@@ -274,5 +276,72 @@ test('what the worker posts replaces the list', async () => {
 
   assert.equal(v.findAll({ type: 'ListItem' }).length, 1)
   assert.ok(v.find({ text: /GLaDOS/ }))
+  await v.unmount()
+})
+
+test('a search says how many packs the catalogue holds, not just how many matched', async () => {
+  const rows = [
+    peonRow(),
+    gladosRow(),
+    ...Array.from({ length: 380 }, (_, index) =>
+      gladosRow({ name: `pack-${index}`, displayName: `Pack ${index}` })
+    )
+  ]
+  const v = await mount(panel, {
+    host: mockHost({ requests: { 'packs.list': () => view({ rows }) } })
+  })
+
+  await v.type({ label: 'Search packs' }, 'GLaDOS')
+
+  assert.ok(v.find({ text: /Showing 1 of 1 matches · 382 packs/ }))
+  await v.unmount()
+})
+
+/**
+ * `plugin.request` defaults to 30 s and an install is a download — 56 MB for the default pack.
+ * The panel passed no override, so the first install on a fresh machine came back `timeout`
+ * while the worker was still downloading. 120 s is Orca's maximum.
+ */
+test('an install is given the long timeout and an ordinary list is not', async () => {
+  const v = await mount(panel, {
+    host: mockHost({
+      requests: { 'packs.list': () => view(), 'packs.install': () => ({ ok: true }) as const }
+    })
+  })
+
+  await v.press({ label: 'Install GLaDOS' })
+
+  const calls = v.host.callsOf('plugin.request') as {
+    name: string
+    timeoutMs?: number
+  }[]
+  const install = calls.find((call) => call.name === 'packs.install')
+  const list = calls.find((call) => call.name === 'packs.list')
+  assert.equal(install?.timeoutMs, 120_000)
+  assert.equal(list?.timeoutMs, undefined)
+  await v.unmount()
+})
+
+test('a row with nothing to preview offers no working Preview button', async () => {
+  const v = await mount(panel, {
+    host: mockHost({
+      requests: { 'packs.list': () => view({ rows: [gladosRow({ canPreview: false })] }) }
+    })
+  })
+
+  assert.equal(v.find({ label: 'Preview GLaDOS' })?.disabled, true)
+  await v.unmount()
+})
+
+test('an installing row shows how much has been downloaded', async () => {
+  const v = await mount(panel, {
+    host: mockHost({
+      requests: {
+        'packs.list': () => view({ rows: [gladosRow({ busy: true, progressBytes: 12_582_912 })] })
+      }
+    })
+  })
+
+  assert.ok(v.find({ type: 'Spinner', label: /Downloading GLaDOS — 12\.0 MB/ }))
   await v.unmount()
 })

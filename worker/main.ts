@@ -21,13 +21,22 @@ import { Store, type StoreApi } from './store.ts'
 const STATUS_BAR_ITEM_ID = 'active-pack'
 const DEFAULT_PACK = 'peon'
 /**
- * What Orca accepts in one `orca.panels.post` payload: 256 KiB, the same number as
- * `PLUGIN_STORAGE_VALUE_MAX_BYTES` in
- * out/shared/plugins/workers/plugin-host-api-storage-schemas.js, and the "at most 256 KiB"
- * in the `panels.post` typings. A `packs.changed` for today's 382-pack registry measures
- * ~129 KB — half the cap, and it grows with the registry, so the push checks before it posts.
+ * Orca's two payload caps, both from `workers/plugin-panel-bridge-protocol.js`:
+ * `POST_MAX_BYTES = 256 * 1024` for one `orca.panels.post`, and `RESULT_MAX_BYTES = 1024 * 1024`
+ * for one `plugin.request` answer. (256 KiB is also `PLUGIN_STORAGE_VALUE_MAX_BYTES` in
+ * out/shared/plugins/workers/plugin-host-api-storage-schemas.js, which is why the registry cache
+ * is a file.) Today's 382-pack registry measures ~129 KB as a push and ~181 KB as a `packs.list`
+ * answer: half the push cap, and 5.8x inside the answer cap. Both grow with the registry, so the
+ * push measures itself before posting rather than letting Orca reject it.
  */
-const POST_MAX_BYTES = 256 * 1024
+export const POST_MAX_BYTES = 256 * 1024
+export const RESULT_MAX_BYTES = 1024 * 1024
+
+/**
+ * How often a download may redraw the panel. Each push rebuilds and serialises the whole list,
+ * so a per-chunk post would spend more time drawing rows than downloading the pack.
+ */
+const PROGRESS_POST_INTERVAL_MS = 1000
 const PLAYABLE_CATEGORIES: readonly PlayableCategory[] = [
   'session.start',
   'task.acknowledge',
@@ -47,7 +56,7 @@ export type Installer = Pick<
   | 'packDir'
   | 'downloadPreview'
 >
-export type Registry = Pick<RegistryClient, 'load'>
+export type Registry = Pick<RegistryClient, 'load'> & { onRefreshed?: (() => void) | null }
 
 export type WorkerDeps = {
   store: Store
@@ -146,6 +155,9 @@ class PeonPing {
   readonly #orca: OrcaWorkerApi
   readonly #deps: WorkerDeps
   readonly #busy = new Set<string>()
+  /** Bytes downloaded so far, per pack being installed, for the row's progress line. */
+  readonly #progress = new Map<string, number>()
+  #lastProgressPostAt = 0
   #firstRunError: string | null = null
   #ready: Promise<void> = Promise.resolve()
 
@@ -164,6 +176,10 @@ class PeonPing {
       this.#orca.panels.handle('packs.remove', (input) => this.#remove(input.name)),
       this.#orca.panels.handle('packs.preview', (input) => this.#preview(input.name))
     ]
+    // A registry refresh that lands behind the panel pushes the new list itself.
+    this.#deps.registry.onRefreshed = () => {
+      void this.#post()
+    }
     await this.#updateStatusBar()
     this.#ready = this.#firstRun()
     return { disposables, ready: this.#ready }
@@ -179,15 +195,22 @@ class PeonPing {
     }
   }
 
+  /**
+   * Deliberately does not wait for `#ready`. The first-run install is a 56 MB download, and
+   * `plugin.request` gives the panel 30 s by default: waiting here meant the first panel open on
+   * a fresh machine — goal #4 of the design — timed out and rendered an error. What is available
+   * now is answered now, and `packs.changed` delivers the pack when it lands.
+   */
   async #list(force: boolean | undefined): Promise<PackListView> {
-    await this.#ready
     return this.#buildView(force)
   }
 
   async #install(name: string): Promise<{ ok: true }> {
     const entry = await this.#entryFor(name)
     try {
-      await this.#withBusy(name, () => this.#deps.installer.install(entry))
+      await this.#withBusy(name, () =>
+        this.#deps.installer.install(entry, (downloaded) => this.#onProgress(name, downloaded))
+      )
       // A pack nobody can hear is no use: the first one installed starts playing.
       if ((await this.#deps.store.getActivePack()) === null) {
         await this.#deps.store.setActivePack(name)
@@ -242,8 +265,11 @@ class PeonPing {
     }
 
     const entry = await this.#entryFor(name)
+    // `preview_sounds` is normalised by the registry parser, which also accepts the `{file}`
+    // shape three live packs use; about 40 packs name none at all, and those rows offer no
+    // Preview button, so this is the belt to that braces.
     const file = entry.preview_sounds?.[0]
-    if (file === undefined) throw new Error(`pack ${name} has no preview sound`)
+    if (file === undefined) throw new Error(`pack ${name} has no sound to preview`)
     return this.#deps.installer.downloadPreview(entry, file)
   }
 
@@ -266,6 +292,8 @@ class PeonPing {
     } catch (error) {
       this.#firstRunError = messageOf(error)
       this.#orca.log(`peon-ping: could not set up the ${DEFAULT_PACK} pack: ${this.#firstRunError}`)
+      // The panel no longer waits for this install, so the failure has to be pushed to it.
+      await this.#post()
     }
   }
 
@@ -279,7 +307,11 @@ class PeonPing {
     if (entry === undefined) {
       throw new Error(result.error ?? `the registry does not list a ${DEFAULT_PACK} pack`)
     }
-    await this.#deps.installer.install(entry)
+    await this.#withBusy(DEFAULT_PACK, () =>
+      this.#deps.installer.install(entry, (downloaded) =>
+        this.#onProgress(DEFAULT_PACK, downloaded)
+      )
+    )
   }
 
   // --- views and side effects -------------------------------------------------------------
@@ -309,7 +341,11 @@ class PeonPing {
         adopted: status.adopted,
         updateAvailable: status.updateAvailable,
         removable: status.removable,
-        busy: this.#busy.has(entry.name)
+        busy: this.#busy.has(entry.name),
+        // An installed pack previews from its own manifest; anything else needs the registry to
+        // name a file. Roughly one row in nine names none, and those offer no Preview.
+        canPreview: status.present || (entry.preview_sounds?.length ?? 0) > 0,
+        progressBytes: this.#progress.get(entry.name) ?? null
       })
     }
 
@@ -329,7 +365,9 @@ class PeonPing {
         adopted: pack.adopted,
         updateAvailable: false,
         removable: !pack.adopted,
-        busy: this.#busy.has(name)
+        busy: this.#busy.has(name),
+        canPreview: true,
+        progressBytes: this.#progress.get(name) ?? null
       })
     }
 
@@ -343,12 +381,14 @@ class PeonPing {
     }
   }
 
-  /** The registry lists hundreds of packs; only the ones on this machine are worth a store read. */
+  /**
+   * The registry lists hundreds of packs; only the ones on this machine are worth a store read.
+   * Tolerant of a row the registry parser somehow let through: a name `packDir` refuses, or a
+   * store value from a future version, costs that row its install state and nothing more. One
+   * row may never be able to fail the whole list again.
+   */
   async #statusOf(entry: RegistryPack, recorded: boolean): Promise<PackStatus> {
-    if (recorded || existsSync(this.#deps.installer.packDir(entry.name))) {
-      return this.#deps.installer.status(entry)
-    }
-    return {
+    const absent: PackStatus = {
       name: entry.name,
       present: false,
       adopted: false,
@@ -356,6 +396,14 @@ class PeonPing {
       updateAvailable: false,
       removable: false
     }
+    try {
+      if (recorded || existsSync(this.#deps.installer.packDir(entry.name))) {
+        return await this.#deps.installer.status(entry)
+      }
+    } catch (error) {
+      this.#orca.log(`peon-ping: ignoring the pack entry ${entry.name}: ${messageOf(error)}`)
+    }
+    return absent
   }
 
   #activePackView(activeName: string | null): PackListView['activePack'] {
@@ -393,7 +441,21 @@ class PeonPing {
       return await run()
     } finally {
       this.#busy.delete(name)
+      this.#progress.delete(name)
     }
+  }
+
+  /**
+   * The byte counter the download cap already keeps, shown on the row being installed — the
+   * design asked for it and `busy` alone left a 56 MB first install looking like a hung spinner.
+   * Throttled, because each push rebuilds and serialises the whole list.
+   */
+  #onProgress(name: string, downloaded: number): void {
+    this.#progress.set(name, downloaded)
+    const now = Date.now()
+    if (now - this.#lastProgressPostAt < PROGRESS_POST_INTERVAL_MS) return
+    this.#lastProgressPostAt = now
+    void this.#post()
   }
 
   async #changed(): Promise<void> {

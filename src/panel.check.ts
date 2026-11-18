@@ -12,6 +12,8 @@ const pack = (over: Partial<PackRowView> & { name: string; displayName: string }
   updateAvailable: false,
   removable: false,
   busy: false,
+  canPreview: true,
+  progressBytes: null,
   ...over
 })
 

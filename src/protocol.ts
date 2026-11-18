@@ -11,6 +11,10 @@ export type PackRowView = {
   updateAvailable: boolean
   removable: boolean
   busy: boolean
+  /** Whether anything can be previewed: ~40 registry entries name no preview sound. */
+  canPreview: boolean
+  /** Bytes downloaded so far while this row is installing, else null. */
+  progressBytes: number | null
 }
 
 export type PackListView = {

@@ -103,6 +103,19 @@ function stubInstaller(overrides?: Partial<Installer>): Installer {
   }
 }
 
+/**
+ * `packs.list` no longer waits for the first-run install (it is a 56 MB download and the panel's
+ * request times out at 30 s), so a test that wants the first run's outcome waits for the push it
+ * makes instead of assuming the request was behind it.
+ */
+async function untilPushed(worker: { posts: readonly { event: string }[] }): Promise<void> {
+  for (let attempt = 0; attempt < 500; attempt++) {
+    if (worker.posts.some((post) => post.event === 'packs.changed')) return
+    await new Promise((resolve) => setTimeout(resolve, 2))
+  }
+  throw new Error('the worker never posted packs.changed')
+}
+
 /** Every test injects stubs so a test run never reaches the network or the real pack folder. */
 function useStubs(overrides?: { installer?: Installer; registry?: Registry; player?: Player }) {
   main.setDepOverrides({
@@ -216,6 +229,7 @@ test('a failed first run does not latch and surfaces in the pack list', async ()
   const host = mockHost({ storage: {} })
 
   const worker = await mountWorker(main, { host })
+  await untilPushed(worker)
   const view = (await worker.request('packs.list', {})) as PackListView
 
   assert.equal(host.data().storage.firstRunDone, undefined)
@@ -401,6 +415,7 @@ test('an install after a failed first run retires the first-run error', async ()
     })
   })
   const worker = await mountWorker(main, { host: mockHost({ storage: {} }) })
+  await untilPushed(worker)
 
   const failed = (await worker.request('packs.list', {})) as PackListView
   assert.match(String(failed.firstRunError), /the network is down/)
@@ -467,6 +482,172 @@ test('a pack list under the push limit is still posted', async () => {
   const posted = worker.posts.filter((post) => post.event === 'packs.changed')
   assert.ok(posted.length > 0)
   assert.equal((posted[posted.length - 1]?.payload as PackListView).rows.length, 20)
+  assert.deepEqual(worker.refusals, [])
+  await worker.deactivate()
+})
+
+/**
+ * The first five minutes on a clean machine. `packs.list` used to await the whole first-run
+ * install — 56 MB of archive — while `plugin.request` gives the panel 30 s, so the first panel
+ * open on exactly the fresh-install path rendered a `timeout` error. If this test ever hangs,
+ * that await is back.
+ */
+test('packs.list answers while the first-run install is still running', async () => {
+  let release: () => void = () => {}
+  const held = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  useStubs({
+    installer: stubInstaller({
+      install: async (pack) => {
+        await held
+        writePack(pack.name, { 'task.complete': ['done.wav'] })
+      }
+    })
+  })
+  const worker = await mountWorker(main, { host: mockHost({ storage: {} }) })
+
+  const view = (await worker.request('packs.list', {})) as PackListView
+
+  assert.deepEqual(
+    view.rows.map((row) => row.name),
+    ['peon', 'glados']
+  )
+  assert.equal(view.activePack, null)
+  assert.equal(view.rows[0].busy, true)
+
+  release()
+  await worker.deactivate()
+})
+
+test('an installing row carries the bytes downloaded so far', async () => {
+  useStubs({
+    installer: stubInstaller({
+      install: async (pack, onProgress) => {
+        onProgress?.(1_000_000)
+        // A real download is still running at this point; the push is fire-and-forget.
+        await new Promise((resolve) => setTimeout(resolve, 20))
+        writePack(pack.name, { 'task.complete': ['done.wav'] })
+      }
+    })
+  })
+  const worker = await mountWorker(main, {
+    host: mockHost({ storage: { firstRunDone: true } })
+  })
+
+  await worker.request('packs.install', { name: 'glados' })
+
+  const progressed = worker.posts
+    .filter((post) => post.event === 'packs.changed')
+    .flatMap((post) => (post.payload as PackListView).rows)
+    .filter((row) => row.name === 'glados' && row.progressBytes !== null)
+  assert.ok(progressed.length > 0)
+  assert.equal(progressed[0].progressBytes, 1_000_000)
+
+  // And it is cleared once the install is over.
+  const view = (await worker.request('packs.list', {})) as PackListView
+  assert.equal(view.rows.find((row) => row.name === 'glados')?.progressBytes, null)
+  await worker.deactivate()
+})
+
+test('a registry refresh that lands behind the panel pushes the new list', async () => {
+  let packs = [entry('peon')]
+  useStubs({
+    registry: {
+      load: async () => ({ index: { version: 1, packs }, fetchedAt: 1, stale: false, error: null }),
+      onRefreshed: null
+    }
+  })
+  const worker = await mountWorker(main, {
+    host: mockHost({ storage: { activePack: 'peon', firstRunDone: true } })
+  })
+
+  packs = [entry('peon'), entry('glados')]
+  main.setDepOverrides({})
+  await worker.request('packs.list', {})
+
+  assert.deepEqual(worker.refusals, [])
+  await worker.deactivate()
+})
+
+/**
+ * Orca's `plugin.request` answer cap is `RESULT_MAX_BYTES` (1 MiB) in
+ * workers/plugin-panel-bridge-protocol.js. Today's 382-pack answer is ~181 KB; this drives it at
+ * 500 packs so the headroom is measured rather than assumed.
+ */
+test('a 500-pack packs.list answer stays inside Orca answer cap', async () => {
+  useStubs({ registry: stubRegistry({ index: syntheticIndex(500) }) })
+  const worker = await mountWorker(main, {
+    host: mockHost({ storage: { firstRunDone: true } })
+  })
+
+  const view = (await worker.request('packs.list', {})) as PackListView
+  const bytes = Buffer.byteLength(JSON.stringify(view), 'utf8')
+
+  assert.ok(bytes < main.RESULT_MAX_BYTES, `a 500-pack answer is ${bytes} bytes`)
+  assert.ok(bytes > main.POST_MAX_BYTES, 'the fixture must be big enough to be worth anything')
+  await worker.deactivate()
+})
+
+test('a row the registry names no preview sound for cannot be previewed', async () => {
+  useStubs({
+    registry: {
+      load: async () => ({
+        index: {
+          version: 1,
+          packs: [{ ...entry('peon'), preview_sounds: undefined }, entry('glados')]
+        },
+        fetchedAt: 1,
+        stale: false,
+        error: null
+      })
+    }
+  })
+  const worker = await mountWorker(main, {
+    host: mockHost({ storage: { firstRunDone: true } })
+  })
+
+  const view = (await worker.request('packs.list', {})) as PackListView
+
+  assert.equal(view.rows.find((row) => row.name === 'peon')?.canPreview, false)
+  assert.equal(view.rows.find((row) => row.name === 'glados')?.canPreview, true)
+  await assert.rejects(worker.request('packs.preview', { name: 'peon' }), /no sound to preview/)
+  assert.deepEqual(worker.refusals, [])
+  await worker.deactivate()
+})
+
+/**
+ * One row the registry parser could not have saved — a name `packDir` refuses — must cost that
+ * row its install state and nothing else. It used to reject `packs.list` for every user.
+ */
+test('a pack entry whose name the filesystem refuses does not fail the whole list', async () => {
+  useStubs({
+    registry: {
+      load: async () => ({
+        index: { version: 1, packs: [{ ...entry('peon'), name: 'Bad.Name' }, entry('glados')] },
+        fetchedAt: 1,
+        stale: false,
+        error: null
+      })
+    },
+    installer: stubInstaller({
+      packDir: (name) => {
+        if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(name)) throw new Error(`Invalid pack name: ${name}`)
+        return join(home, '.openpeon', 'packs', name)
+      }
+    })
+  })
+  const worker = await mountWorker(main, {
+    host: mockHost({ storage: { firstRunDone: true } })
+  })
+
+  const view = (await worker.request('packs.list', {})) as PackListView
+
+  assert.deepEqual(
+    view.rows.map((row) => row.name),
+    ['Bad.Name', 'glados']
+  )
+  assert.equal(view.rows[0].present, false)
   assert.deepEqual(worker.refusals, [])
   await worker.deactivate()
 })

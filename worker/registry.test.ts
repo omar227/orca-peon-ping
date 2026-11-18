@@ -16,7 +16,8 @@ import {
   type RegistryCacheIo,
   REGISTRY_TTL_MS,
   RegistryClient,
-  fileRegistryCache
+  fileRegistryCache,
+  parseRegistryIndex
 } from './registry.ts'
 import { syntheticIndex } from './testing/registry-fixture.ts'
 
@@ -76,15 +77,78 @@ test('a fresh cache is served without fetching', async () => {
   assert.equal(result.stale, false)
 })
 
-test('an expired cache triggers a fetch and is replaced', async () => {
+/**
+ * The first open on a machine that has been away for a day must not wait on a 540 KB fetch:
+ * `plugin.request` gives the panel 30 s by default and the whole thing rendered an error. The
+ * out-of-date cache answers at once and the refresh lands behind it.
+ */
+test('an expired cache answers immediately and is replaced behind the panel', async () => {
   seedCache({ fetchedAt: 0, index: { version: 1, packs: [] } })
+  const refreshes: number[] = []
   const client = new RegistryClient({
     home,
     now: () => REGISTRY_TTL_MS + 1,
+    onRefreshed: () => refreshes.push(1),
     fetchImpl: ok(JSON.stringify(index)) as typeof fetch
   })
-  assert.equal((await client.load()).index?.packs.length, 1)
+
+  const immediate = await client.load()
+  assert.equal(immediate.index?.packs.length, 0)
+  assert.equal(immediate.error, null)
+  assert.equal(immediate.stale, false)
+
+  await client.settled()
+  assert.equal(refreshes.length, 1)
   assert.equal(readCacheFile().index.packs.length, 1)
+  assert.equal((await client.load()).index?.packs.length, 1)
+})
+
+test('a refresh behind the panel runs once, however many loads ask for it', async () => {
+  seedCache({ fetchedAt: 0, index: { version: 1, packs: [] } })
+  let fetches = 0
+  const client = new RegistryClient({
+    home,
+    now: () => REGISTRY_TTL_MS + 1,
+    fetchImpl: (async () => {
+      fetches++
+      return new Response(JSON.stringify(index))
+    }) as typeof fetch
+  })
+
+  await Promise.all([client.load(), client.load(), client.load()])
+  await client.settled()
+
+  assert.equal(fetches, 1)
+})
+
+/**
+ * A failed background refresh leaves the cache out of date, and every `packs.changed` push
+ * calls `load()` again: without the cooldown the push and the refresh spin on each other for
+ * as long as the registry is unreachable.
+ */
+test('a failed background refresh is not retried on every load', async () => {
+  seedCache({ fetchedAt: 0, index } as RegistryCache)
+  let fetches = 0
+  const client = new RegistryClient({
+    home,
+    now: () => REGISTRY_TTL_MS + 1,
+    fetchImpl: (async () => {
+      fetches++
+      throw new Error('offline')
+    }) as typeof fetch
+  })
+
+  await client.load()
+  await client.settled()
+  for (let i = 0; i < 5; i++) {
+    await client.load()
+    await client.settled()
+  }
+
+  assert.equal(fetches, 1)
+  const after = await client.load()
+  assert.equal(after.stale, true)
+  assert.ok(after.error?.includes('offline'))
 })
 
 // Review Focus 4
@@ -95,6 +159,9 @@ test('an HTML error page leaves the cached index intact', async () => {
     now: () => REGISTRY_TTL_MS + 1,
     fetchImpl: ok('<!DOCTYPE html><title>404</title>') as typeof fetch
   })
+  await client.load()
+  await client.settled()
+
   const result = await client.load()
   assert.equal(result.index?.packs.length, 1)
   assert.equal(result.stale, true)
@@ -109,6 +176,9 @@ test('a non-200 response leaves the cached index intact', async () => {
     now: () => REGISTRY_TTL_MS + 1,
     fetchImpl: (async () => new Response('', { status: 503 })) as typeof fetch
   })
+  await client.load()
+  await client.settled()
+
   const result = await client.load()
   assert.equal(result.index?.packs.length, 1)
   assert.ok(result.error)
@@ -299,4 +369,60 @@ test('the cache file lands atomically, never as a partial write', () => {
     readdirSync(join(home, '.openpeon')).filter((name) => name.endsWith('.tmp')),
     []
   )
+})
+
+/**
+ * One row named `Bad.Name` used to reject `packs.list` outright — `packDir` refuses the name,
+ * the throw escaped, and nobody could list, install or switch a pack until the registry was
+ * fixed. A bad row may cost that row and nothing else.
+ */
+test('malformed registry rows are dropped, not thrown, and the good ones survive', () => {
+  const logs: string[] = []
+  const parsed = parseRegistryIndex(
+    JSON.stringify({
+      version: 1,
+      packs: [
+        { ...index.packs[0], name: 'Bad.Name' },
+        { name: 'missing-fields' },
+        { ...index.packs[0], name: 'no-sound-count', sound_count: 'twelve' },
+        { ...index.packs[0], name: 'bad-repo', source_repo: 'not-a-repo' },
+        'not even an object',
+        null,
+        index.packs[0]
+      ]
+    }),
+    (message) => logs.push(message)
+  )
+
+  assert.deepEqual(
+    parsed.packs.map((pack) => pack.name),
+    ['peon']
+  )
+  assert.ok(logs.some((line) => line.includes('ignored 6 of 7')))
+})
+
+test('object-shaped preview_sounds are accepted and empty ones become absent', () => {
+  const parsed = parseRegistryIndex(
+    JSON.stringify({
+      version: 1,
+      packs: [
+        { ...index.packs[0], name: 'itysl', preview_sounds: [{ file: 'a.wav', label: 'A' }] },
+        { ...index.packs[0], name: 'nothing', preview_sounds: [] },
+        { ...index.packs[0], name: 'absent' },
+        { ...index.packs[0], name: 'junk', preview_sounds: [{ label: 'no file' }, 7] }
+      ]
+    })
+  )
+
+  const by = (name: string) => parsed.packs.find((pack) => pack.name === name)
+  assert.deepEqual(by('itysl')?.preview_sounds, ['a.wav'])
+  assert.equal(by('nothing')?.preview_sounds, undefined)
+  assert.equal(by('absent')?.preview_sounds, undefined)
+  assert.equal(by('junk')?.preview_sounds, undefined)
+})
+
+test('an index that is not an index still throws, so the cache is kept', () => {
+  assert.throws(() => parseRegistryIndex('[]'))
+  assert.throws(() => parseRegistryIndex('{"version":2,"packs":[]}'))
+  assert.throws(() => parseRegistryIndex('<!DOCTYPE html>'))
 })
