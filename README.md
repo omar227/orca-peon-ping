@@ -30,16 +30,20 @@ whether to go look.
 2. Approve the access it asks for when prompted — see [Access requested](#access-requested)
    below.
 3. Open the **Peon Ping** panel in the right sidebar. On first run the plugin installs the
-   default pack (`peon`, the Warcraft III orc, ~2 MB) automatically; nothing else to do.
+   default pack (`peon`, the Warcraft III orc) automatically; nothing else to do. Expect it
+   to pull about **56 MB** the first time: the pack itself is 872 KB, but it lives in a
+   43-pack repository and GitHub only serves whole-tag archives, so that is what the download
+   really costs (58,299,881 bytes at the tag the registry pins today). It runs in the
+   background — the panel opens and works while it downloads, and the row shows the progress.
 4. **Turn off Orca's own notification sound** in Orca's settings, so the system chime and
    the voice line don't both fire for the same event.
 
 ### Platform support
 
 This version only plays sound on **macOS**, via `afplay`. On Linux and Windows the
-plugin loads and the panel works — you can browse the registry, install packs, and
-preview sounds — but no sound plays on agent events, and the panel says so plainly
-instead of failing silently. Linux (`pw-play` / `paplay` / `ffplay` / `mpv` / `play` /
+plugin loads and the panel works — you can browse the registry, install packs and switch
+between them — but **nothing plays at all**: not agent events, and not Preview, which is
+disabled on every row. The panel says so plainly instead of failing silently. Linux (`pw-play` / `paplay` / `ffplay` / `mpv` / `play` /
 `aplay`) and Windows playback are designed for and documented as later work; see the
 [design doc](docs/superpowers/specs/2026-11-18-orca-peon-ping-design.md#later-not-now).
 They ship when someone who runs that platform can confirm they actually hear it — not

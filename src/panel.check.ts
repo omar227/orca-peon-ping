@@ -17,13 +17,18 @@ const pack = (over: Partial<PackRowView> & { name: string; displayName: string }
   ...over
 })
 
+/**
+ * Real rows, copied from the live registry (`peonping.github.io/registry/index.json`) so the
+ * screenshot in the README is the product rather than a fixture: the names, sound counts and
+ * sizes are the ones a person actually sees.
+ */
 const peon = pack({
   name: 'peon',
-  displayName: 'Warcraft Peon',
-  description: 'Work work. The namesake pack.',
+  displayName: 'Orc Peon',
+  description: 'Orc Peon sound pack from Warcraft III',
   trustTier: 'official',
-  sizeBytes: 2_100_000,
-  soundCount: 24,
+  sizeBytes: 872_012,
+  soundCount: 27,
   present: true,
   active: true,
   removable: true
@@ -33,46 +38,66 @@ const rows: PackRowView[] = [
   peon,
   pack({
     name: 'glados',
-    displayName: 'GLaDOS',
-    description: 'Aperture Science Enrichment Center announcements.',
-    trustTier: 'verified',
-    soundCount: 18
-  }),
-  pack({
-    name: 'sc2-adjutant',
-    displayName: 'StarCraft II Adjutant and Terran Command Centre',
-    description:
-      'A long display name and a long description, to show how a narrow sidebar handles both.',
-    trustTier: 'verified',
-    sizeBytes: 5_600_000,
-    soundCount: 31,
+    displayName: 'GLaDOS (Portal)',
+    description: 'GLaDOS (Portal) sound pack from Portal',
+    trustTier: 'official',
+    sizeBytes: 1_143_346,
+    soundCount: 23,
     present: true,
-    updateAvailable: true,
     removable: true
   }),
   pack({
-    name: 'tf2-engineer',
-    displayName: 'TF2 Engineer',
-    description: 'Adopted from the peon-ping CLI, so Peon Ping will not delete it.',
-    sizeBytes: 3_200_000,
+    name: 'duke_nukem',
+    displayName: 'Duke Nukem',
+    description: 'Duke Nukem sound pack from Duke Nukem',
+    trustTier: 'official',
+    sizeBytes: 7_737_086,
+    soundCount: 24,
+    busy: true,
+    progressBytes: 18_350_080
+  }),
+  pack({
+    name: 'protoss_probe',
+    displayName: 'Protoss Probe (StarCraft)',
+    description: 'Original StarCraft (1998) Protoss Probe unit sounds',
+    trustTier: 'verified',
+    sizeBytes: 1_044_060,
+    soundCount: 16
+  }),
+  pack({
+    name: 'solid_snake',
+    displayName: 'Solid Snake',
+    description:
+      'Tactical espionage audio - featuring the legendary Solid Snake from the Metal Gear ' +
+      'Solid series',
+    sizeBytes: 1_067_760,
+    soundCount: 32,
     present: true,
     adopted: true
   }),
   pack({
-    name: 'duke-nukem',
-    displayName: 'Duke Nukem',
-    description: 'Installing now.',
-    busy: true
+    name: 'itysl',
+    displayName: 'I Think You Should Leave',
+    description: 'Tim Robinson voice lines from I Think You Should Leave with Tim Robinson',
+    sizeBytes: 2_070_304,
+    soundCount: 24
   }),
-  pack({ name: 'r2d2', displayName: 'R2-D2', description: 'Astromech beeps.', soundCount: 9 })
+  pack({
+    name: 'speaki',
+    displayName: 'Petite Speaki',
+    description: 'Petite Speaki voice pack from Trickcal Chibi Go',
+    sizeBytes: 1_104_000,
+    soundCount: 13,
+    canPreview: false
+  })
 ]
 
 const view = (over: Partial<PackListView> = {}): PackListView => ({
   rows,
   activePack: {
     name: 'peon',
-    displayName: 'Warcraft Peon',
-    covered: ['session.start', 'input.required', 'task.complete', 'task.error']
+    displayName: 'Orc Peon',
+    covered: ['session.start', 'task.acknowledge', 'input.required', 'task.complete', 'task.error']
   },
   stale: false,
   error: null,
@@ -83,6 +108,7 @@ const view = (over: Partial<PackListView> = {}): PackListView => ({
 
 const uninstalled = rows.map((row) => ({
   ...row,
+  progressBytes: null,
   present: false,
   active: false,
   adopted: false,
