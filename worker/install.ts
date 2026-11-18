@@ -1,15 +1,18 @@
 import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import {
+  closeSync,
   existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readFileSync,
   readdirSync,
   renameSync,
   rmSync,
-  writeFileSync
+  writeFileSync,
+  writeSync
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path'
@@ -19,6 +22,34 @@ import type { RegistryPack } from './registry.ts'
 import type { InstalledPack, Store } from './store.ts'
 
 export const MANIFEST_FILE = 'openpeon.json'
+
+/**
+ * What one install may pull over the network, and what it may unpack onto the disk.
+ *
+ * Neither bound can be taken on trust from somewhere else. Packs come from arbitrary community
+ * repositories; `source_ref` is a *tag*, which the repository owner can re-point at different
+ * content after the pack was listed; `manifest_sha256` covers only `openpeon.json` and is checked
+ * after extraction, so it bounds nothing; and `codeload.github.com` sends no `Content-Length` at
+ * all on a tag archive (checked against the real host), so a header test would pass everything.
+ * The only honest bounds are counting the bytes as they arrive and measuring the unpacked tree.
+ *
+ * The numbers. The default `peon` pack is an 872 KB pack inside a 43-pack repository, and GitHub
+ * only serves whole-tag archives, so a first run really downloads 58,299,881 bytes — 56 MB — for
+ * it (measured against the tag the registry pins, `PeonPing/og-packs` v1.0.0; that repo's newer
+ * v1.1.0 tag is 62,009,213 bytes). Any cap at or below 64 MB would therefore break the default
+ * install, which is the plugin's own headline failure. 150 MB leaves ~2.5x headroom over the
+ * largest archive the plugin is known to need, and 300 MB extracted allows for an archive that
+ * compresses well without letting a gzip bomb fill the disk: the staging tree is measured and
+ * deleted before anything is moved into place.
+ */
+export const MAX_DOWNLOAD_BYTES = 150 * 1024 * 1024
+export const MAX_EXTRACTED_BYTES = 300 * 1024 * 1024
+
+/** Called with the running total of bytes downloaded, so the panel can show progress. */
+export type InstallProgress = (downloadedBytes: number) => void
+
+/** How long a downloaded preview sound is kept before the next preview clears it away. */
+const PREVIEW_RETENTION_MS = 600_000
 
 export type PackStatus = {
   name: string
@@ -119,8 +150,11 @@ function sourcePathOf(entry: RegistryPack): string {
 /**
  * Refuses any extracted entry that is not a plain file or directory. A symlink would let a pack
  * point the player at files outside the pack, which `resolveSoundPath`'s lexical check cannot see.
+ * Returns the tree's total size in bytes, which is how the extraction cap is measured: `tar`'s own
+ * `--totals` prints a different thing on GNU and BSD tar, and macOS ships BSD tar.
  */
-function assertPlainTree(dir: string, root: string): void {
+function assertPlainTree(dir: string, root: string): number {
+  let bytes = 0
   for (const name of readdirSync(dir)) {
     const full = join(dir, name)
     const stats = lstatSync(full)
@@ -129,7 +163,7 @@ function assertPlainTree(dir: string, root: string): void {
       throw new Error(`pack entry is a symbolic link: ${shown}`)
     }
     if (stats.isDirectory()) {
-      assertPlainTree(full, root)
+      bytes += assertPlainTree(full, root)
       continue
     }
     if (!stats.isFile()) {
@@ -138,7 +172,14 @@ function assertPlainTree(dir: string, root: string): void {
     if (stats.nlink > 1) {
       throw new Error(`pack entry is a hard link: ${shown}`)
     }
+    bytes += stats.size
   }
+  return bytes
+}
+
+/** Sizes in the error messages a person reads, so "150 MB" is what they see, not 157286400. */
+function megabytes(bytes: number): string {
+  return `${Math.round(bytes / (1024 * 1024))} MB`
 }
 
 export class PackInstaller {
@@ -146,15 +187,26 @@ export class PackInstaller {
   readonly #home: string | undefined
   readonly #fetchImpl: typeof fetch
   readonly #now: () => number
+  readonly #maxExtractedBytes: number
+  /** The one temp directory downloaded previews land in, made on the first press. */
+  #previews: string | undefined
+  #previewCount = 0
 
   constructor(
     store: Store,
-    options?: { home?: string; fetchImpl?: typeof fetch; now?: () => number }
+    options?: {
+      home?: string
+      fetchImpl?: typeof fetch
+      now?: () => number
+      /** Only for tests, which cannot afford to unpack 300 MB to prove the cap works. */
+      maxExtractedBytes?: number
+    }
   ) {
     this.#store = store
     this.#home = options?.home
     this.#fetchImpl = options?.fetchImpl ?? fetch
     this.#now = options?.now ?? Date.now
+    this.#maxExtractedBytes = options?.maxExtractedBytes ?? MAX_EXTRACTED_BYTES
   }
 
   packDir(name: string): string {
@@ -170,7 +222,7 @@ export class PackInstaller {
    * destination and is only swapped into place once the whole tree has been validated, so a
    * failure at any point leaves the destination exactly as it was.
    */
-  async install(entry: RegistryPack): Promise<void> {
+  async install(entry: RegistryPack, onProgress?: InstallProgress): Promise<void> {
     const dest = this.packDir(entry.name)
     if ((await this.#store.getInstalled())[entry.name]?.adopted === true) {
       throw new Error(
@@ -184,12 +236,19 @@ export class PackInstaller {
     const staging = mkdtempSync(join(root, '.install-'))
     try {
       const tarball = join(staging, 'pack.tar.gz')
-      writeFileSync(tarball, await this.#downloadTarball(entry))
+      await this.#downloadTarball(entry, tarball, onProgress)
 
       const extracted = join(staging, 'extract')
       mkdirSync(extracted)
       await this.#extractPack(entry, tarball, extracted)
-      assertPlainTree(extracted, extracted)
+      const unpackedBytes = assertPlainTree(extracted, extracted)
+      if (unpackedBytes > this.#maxExtractedBytes) {
+        throw new Error(
+          `pack ${entry.name} unpacks to ${unpackedBytes} bytes, more than the ` +
+            `${this.#maxExtractedBytes} Peon Ping will install. Nothing was kept. ` +
+            'Install it with the peon-ping CLI if you really want a pack this large.'
+        )
+      }
 
       const manifestFile = join(extracted, MANIFEST_FILE)
       if (!existsSync(manifestFile)) {
@@ -219,13 +278,64 @@ export class PackInstaller {
     }
   }
 
-  async #downloadTarball(entry: RegistryPack): Promise<Buffer> {
+  /**
+   * Streams the archive to disk, counting bytes as they arrive and stopping the moment the count
+   * passes `MAX_DOWNLOAD_BYTES`. Counting rather than reading a header is deliberate: the host
+   * sends no `Content-Length`, and buffering the whole body first — as this used to — is what an
+   * oversized or endless archive would have used to stall or kill the worker.
+   */
+  async #downloadTarball(
+    entry: RegistryPack,
+    target: string,
+    onProgress?: InstallProgress
+  ): Promise<number> {
     const url = `https://github.com/${entry.source_repo}/archive/refs/tags/${entry.source_ref}.tar.gz`
     const response = await this.#fetchImpl(url)
     if (!response.ok) {
       throw new Error(`pack download failed with ${response.status}: ${url}`)
     }
-    return Buffer.from(await response.arrayBuffer())
+
+    const body = response.body
+    if (body === null) {
+      // No stream to read: take the body whole, but still refuse an oversized one.
+      const bytes = Buffer.from(await response.arrayBuffer())
+      this.#assertWithinDownloadCap(entry, bytes.byteLength)
+      writeFileSync(target, bytes)
+      onProgress?.(bytes.byteLength)
+      return bytes.byteLength
+    }
+
+    const reader = body.getReader()
+    const file = openSync(target, 'w')
+    let downloaded = 0
+    try {
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        downloaded += value.byteLength
+        this.#assertWithinDownloadCap(entry, downloaded, reader)
+        writeSync(file, value)
+        onProgress?.(downloaded)
+      }
+    } finally {
+      closeSync(file)
+    }
+    return downloaded
+  }
+
+  #assertWithinDownloadCap(
+    entry: RegistryPack,
+    downloaded: number,
+    reader?: { cancel(): Promise<void> }
+  ): void {
+    if (downloaded <= MAX_DOWNLOAD_BYTES) return
+    // Stop pulling bytes before failing, so an endless archive does not keep the socket busy.
+    void reader?.cancel().catch(() => {})
+    throw new Error(
+      `pack ${entry.name} is larger than the ${megabytes(MAX_DOWNLOAD_BYTES)} Peon Ping will ` +
+        `download: the download was stopped after ${megabytes(downloaded)} and nothing was ` +
+        'kept. Ask the pack author for a smaller archive, or install it with the peon-ping CLI.'
+    )
   }
 
   /** Extracts just the pack's subtree, with every entry path checked before tar writes it. */
@@ -239,7 +349,8 @@ export class PackInstaller {
     const member = `${archiveRootOf(entryPaths)}/${sourcePathOf(entry)}`
     tarEntryTarget(into, member)
     const depth = member.split('/').length
-    await runTar(['-xzf', tarball, '-C', into, '--strip-components', String(depth), member])
+    // `--` so a member name beginning with a dash is an operand and never an option to tar.
+    await runTar(['-xzf', tarball, '-C', into, '--strip-components', String(depth), '--', member])
   }
 
   /**
@@ -309,10 +420,30 @@ export class PackInstaller {
       throw new Error(`preview download failed with ${response.status}: ${url}`)
     }
 
-    const dir = mkdtempSync(join(tmpdir(), 'peon-ping-preview-'))
-    const target = join(dir, basename(relativePath))
+    this.#previewCount += 1
+    const target = join(this.#previewDir(), `${this.#previewCount}-${basename(relativePath)}`)
     writeFileSync(target, Buffer.from(await response.arrayBuffer()))
     return target
+  }
+
+  /**
+   * One temp directory for the whole worker, not one per press, and anything in it older than
+   * `PREVIEW_RETENTION_MS` goes. Deleting the previous file outright would race the player, which
+   * is spawned detached and may not have opened it yet.
+   */
+  #previewDir(): string {
+    this.#previews ??= mkdtempSync(join(tmpdir(), 'peon-ping-preview-'))
+    // Real clock, not the injected one: it is compared against a real file's mtime.
+    const cutoff = Date.now() - PREVIEW_RETENTION_MS
+    for (const name of readdirSync(this.#previews)) {
+      const full = join(this.#previews, name)
+      try {
+        if (lstatSync(full).mtimeMs < cutoff) rmSync(full, { force: true })
+      } catch {
+        // A preview that cannot be cleaned up is not a reason to refuse to play the next one.
+      }
+    }
+    return this.#previews
   }
 
   async #record(name: string, fields: Omit<InstalledPack, 'name' | 'installedAt'>): Promise<void> {

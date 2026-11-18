@@ -68,3 +68,11 @@ test('coveredCategories lists only categories with at least one sound', () => {
     ['session.start', 'task.complete']
   )
 })
+
+test('resolveSoundPath refuses a path that is the pack directory rather than a sound', () => {
+  // `..` joins to `.`, which used to resolve to the pack directory and reach afplay as one.
+  for (const bad of ['..', '', 'sounds/..', '../', 'a/../..']) {
+    assert.throws(() => resolveSoundPath('/packs/peon', bad), undefined, `allowed: ${bad}`)
+  }
+  assert.equal(resolveSoundPath('/packs/peon', 'a.wav'), '/packs/peon/sounds/a.wav')
+})

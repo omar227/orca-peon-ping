@@ -61,3 +61,19 @@ test('a corrupted installedPacks value reads back as empty rather than throwing'
   })
   assert.deepEqual(Object.keys(await store.getInstalled()), ['peon'])
 })
+
+test('a corrupted lastPlayed value reads back as empty rather than throwing', async () => {
+  const api = memoryStoreApi()
+  await api.set('lastPlayed', 'not an object')
+  const store = new Store(api)
+
+  assert.equal(await store.getLastPlayed('task.complete'), null)
+  await store.setLastPlayed('task.complete', 'done.wav')
+  assert.equal(await store.getLastPlayed('task.complete'), 'done.wav')
+})
+
+test('a lastPlayed entry that is not a string reads back as absent', async () => {
+  const api = memoryStoreApi()
+  await api.set('lastPlayed', { 'task.complete': 42 })
+  assert.equal(await new Store(api).getLastPlayed('task.complete'), null)
+})

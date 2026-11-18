@@ -51,6 +51,9 @@ export function resolveCategory(manifest: CespManifest, category: string): CespS
 }
 
 export function resolveSoundPath(packDir: string, file: string): string {
+  if (file.length === 0) {
+    throw new Error('CESP sound file is empty')
+  }
   if (isAbsolute(file)) {
     throw new Error(`CESP sound file must be a relative path: ${file}`)
   }
@@ -59,7 +62,9 @@ export function resolveSoundPath(packDir: string, file: string): string {
   const resolvedPackDir = resolve(packDir)
   const resolved = resolve(resolvedPackDir, relative)
 
-  if (resolved !== resolvedPackDir && !resolved.startsWith(resolvedPackDir + sep)) {
+  // Strictly *inside* the pack: `..` resolves to the pack directory itself, which is not a sound
+  // and which the player would hand to `afplay` as a directory.
+  if (!resolved.startsWith(resolvedPackDir + sep)) {
     throw new Error(`CESP sound file escapes the pack directory: ${file}`)
   }
 

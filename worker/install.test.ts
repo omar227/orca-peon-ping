@@ -14,7 +14,13 @@ import {
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, assert, beforeEach, test } from 'orca/testing'
-import { PackInstaller, tarEntryTarget, verifySoundFile } from './install.ts'
+import {
+  MAX_DOWNLOAD_BYTES,
+  MAX_EXTRACTED_BYTES,
+  PackInstaller,
+  tarEntryTarget,
+  verifySoundFile
+} from './install.ts'
 import { packDir, packsRoot } from './paths.ts'
 import type { RegistryPack } from './registry.ts'
 import { Store } from './store.ts'
@@ -399,4 +405,111 @@ test('verifySoundFile accepts a matching hash, rejects a wrong one, and passes w
   assert.equal(await verifySoundFile(file, 'deadbeef'), false)
   assert.equal(await verifySoundFile(file, null), true)
   assert.equal(await verifySoundFile(join(tmpHome, 'missing.wav'), null), false)
+})
+
+/**
+ * The cap the whole pipeline hangs on. `codeload.github.com` sends no `Content-Length` on a tag
+ * archive, so this fixture does not either: the only thing that can stop it is counting bytes as
+ * they arrive. It pushes past the real `MAX_DOWNLOAD_BYTES`, not an injected one, because a cap
+ * that is only ever exercised at a test-sized value is a cap nobody has checked.
+ */
+function endlessStream(chunkBytes = 8 * 1024 * 1024): typeof fetch {
+  return (async () => {
+    const chunk = new Uint8Array(chunkBytes)
+    return new Response(
+      new ReadableStream({
+        pull(controller) {
+          controller.enqueue(chunk)
+        }
+      })
+    )
+  }) as unknown as typeof fetch
+}
+
+test('the download cap clears the default pack, which is 56 MB of archive', () => {
+  // PeonPing/og-packs v1.0.0, the tag the registry pins `peon` to, measured against the real
+  // host. A cap at or below 64 MB would break the first-run install this plugin depends on.
+  assert.ok(
+    MAX_DOWNLOAD_BYTES > 58_299_881,
+    `the default pack's archive must fit under the cap; the cap is ${MAX_DOWNLOAD_BYTES}`
+  )
+  assert.ok(MAX_EXTRACTED_BYTES >= MAX_DOWNLOAD_BYTES)
+})
+
+test('an oversized download is refused and leaves the packs root empty', async () => {
+  const store = new Store(memoryStoreApi())
+  const installer = new PackInstaller(store, { home: tmpHome, fetchImpl: endlessStream() })
+
+  await assert.rejects(() => installer.install(entry), /larger than the 150 MB/)
+
+  assert.equal(existsSync(packDir('peon', tmpHome)), false)
+  assert.deepEqual(await store.getInstalled(), {})
+  assert.deepEqual(packsRootEntries(), [])
+})
+
+/**
+ * The extraction half, which is what a gzip bomb hits: a small archive, a large tree. The cap is
+ * lowered for the test rather than unpacking 300 MB in a unit test — the mechanism, the error and
+ * the cleanup are what this proves; `MAX_EXTRACTED_BYTES` itself is the number in the comment.
+ */
+test('a pack that unpacks past the extraction cap is refused and leaves nothing behind', async () => {
+  const bytes = buildTarball((root) => {
+    const pack = join(root, 'peon')
+    mkdirSync(join(pack, 'sounds'), { recursive: true })
+    writeFileSync(join(pack, 'openpeon.json'), manifestJson('peon', '1.0.0', 'hello.wav'))
+    // Compresses to almost nothing and unpacks to 64 KB: a bomb in miniature.
+    writeFileSync(join(pack, 'sounds', 'hello.wav'), 'a'.repeat(64 * 1024))
+  })
+  const store = new Store(memoryStoreApi())
+  const installer = new PackInstaller(store, {
+    home: tmpHome,
+    fetchImpl: serving(bytes),
+    maxExtractedBytes: 1024
+  })
+
+  await assert.rejects(() => installer.install(entry), /unpacks to/)
+
+  assert.equal(existsSync(packDir('peon', tmpHome)), false)
+  assert.deepEqual(await store.getInstalled(), {})
+  assert.deepEqual(packsRootEntries(), [])
+})
+
+test('a pack under the extraction cap still installs', async () => {
+  const installer = new PackInstaller(new Store(memoryStoreApi()), {
+    home: tmpHome,
+    fetchImpl: serving(packTarball()),
+    maxExtractedBytes: 1024 * 1024
+  })
+  await installer.install(entry)
+  assert.ok(existsSync(installer.manifestPath('peon')))
+})
+
+test('install reports download progress as the bytes arrive', async () => {
+  const seen: number[] = []
+  const installer = new PackInstaller(new Store(memoryStoreApi()), {
+    home: tmpHome,
+    fetchImpl: serving(packTarball())
+  })
+
+  await installer.install(entry, (downloaded) => seen.push(downloaded))
+
+  assert.ok(seen.length > 0)
+  assert.ok(seen[seen.length - 1] > 0)
+  // Monotonic: it is a running total, not a per-chunk size.
+  assert.deepEqual([...seen].sort((a, b) => a - b), seen)
+})
+
+test('repeated previews reuse one temp directory instead of leaking one each', async () => {
+  const installer = new PackInstaller(new Store(memoryStoreApi()), {
+    home: tmpHome,
+    fetchImpl: (async () => new Response('preview-audio')) as unknown as typeof fetch
+  })
+
+  const first = await installer.downloadPreview(entry, 'PeonReady1.wav')
+  const second = await installer.downloadPreview(entry, 'PeonReady2.wav')
+  scratch.push(dirname(first))
+
+  assert.equal(dirname(first), dirname(second))
+  assert.notEqual(first, second)
+  assert.equal(readFileSync(second, 'utf8'), 'preview-audio')
 })
