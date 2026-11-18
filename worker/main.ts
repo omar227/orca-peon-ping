@@ -279,6 +279,11 @@ class PeonPing {
     const installed = await this.#deps.store.getInstalled()
     const activeName = await this.#deps.store.getActivePack()
 
+    // The first-run error describes a machine with no pack at all. Once one is active — whether
+    // the retry, an install from the panel or an adoption put it there — the condition is gone,
+    // and retiring the message here means no later path can leave it outliving its condition.
+    if (activeName !== null) this.#firstRunError = null
+
     const rows: PackRowView[] = []
     for (const entry of result.index?.packs ?? []) {
       const status = await this.#statusOf(entry, installed[entry.name] !== undefined)

@@ -388,3 +388,29 @@ test('a failed install reaches the panel and leaves no row busy', async () => {
   assert.deepEqual(worker.refusals, [])
   await worker.deactivate()
 })
+
+test('an install after a failed first run retires the first-run error', async () => {
+  let failing = true
+  useStubs({
+    installer: stubInstaller({
+      install: async (pack) => {
+        if (failing) throw new Error('the network is down')
+        writePack(pack.name, { 'task.complete': ['done.wav'] })
+      }
+    })
+  })
+  const worker = await mountWorker(main, { host: mockHost({ storage: {} }) })
+
+  const failed = (await worker.request('packs.list', {})) as PackListView
+  assert.match(String(failed.firstRunError), /the network is down/)
+  assert.equal(failed.activePack, null)
+
+  failing = false
+  await worker.request('packs.install', { name: 'peon' })
+
+  const recovered = (await worker.request('packs.list', {})) as PackListView
+  assert.equal(recovered.firstRunError, null)
+  assert.equal(recovered.activePack?.name, 'peon')
+  assert.deepEqual(worker.refusals, [])
+  await worker.deactivate()
+})
