@@ -101,8 +101,9 @@ Peon Ping asks for exactly four capabilities, all scoped to itself:
 - `notifications:show` — for the muted/unsupported-platform fallback notification.
 
 It runs as a `trusted-worker` (a separate Node process on your machine). It makes network
-requests only to `github.com` (pack downloads) and `peonping.github.io` (the registry
-index). No telemetry, no analytics, no terminal reading.
+requests only to `github.com` (pack downloads), `raw.githubusercontent.com` (preview
+sounds, fetched one file at a time before you install a pack), and `peonping.github.io`
+(the registry index). No telemetry, no analytics, no terminal reading.
 
 ## Credit
 

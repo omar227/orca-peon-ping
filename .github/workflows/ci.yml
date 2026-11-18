@@ -1,4 +1,4 @@
-# CI does NOT validate this plugin.
+# CI does NOT validate this plugin, and does NOT check its TypeScript.
 #
 # Orca is not installed on GitHub-hosted runners, so this workflow cannot run
 # `orca plugin validate .`, `orca plugin test .`, or `orca plugin check .` — the
@@ -10,22 +10,34 @@
 # pre-tag checklist — see the "Pre-tag checklist" section of README.md. Run them,
 # and confirm by ear in a real Orca session, before tagging a release.
 #
-# What this workflow actually does, as the next most useful honest thing:
+# Why there is no TypeScript syntax-check step here, even a lightweight one:
 #
-# 1. Every worker/*.test.ts and src/*.test.tsx file imports `test`/`assert`/etc.
+# 1. Every worker/*.test.ts and src/panel.test.tsx file imports `test`/`assert`/etc.
 #    from `orca/testing`, which only resolves inside Orca's plugin runtime. There
-#    is no dependency-free test file in this repo that `node --test` can run
-#    standalone, so this job does not run the test suite at all — it would either
-#    fail to resolve `orca/testing` or (worse) silently run nothing.
-# 2. Instead it does a syntax-only parse pass with `node --check` (via
-#    `--experimental-strip-types`) over every non-JSX TypeScript source file, which
-#    catches typos and syntax errors without needing `orca` to resolve. `.tsx`
-#    files (the panel and its test) are skipped: Node's `--check` does not strip
-#    JSX, and `orca plugin check .` is what actually renders the panel.
-# 3. It also checks that `orca-plugin.json` is valid JSON and has the manifest
-#    fields the plugin loader requires. This is a structural sanity check, not a
-#    schema validation against Orca's actual plugin schema — that happens in
-#    `orca plugin validate .`.
+#    is no dependency-free test file in this repo, so `node --test` cannot run
+#    anything standalone.
+# 2. An earlier version of this workflow substituted `node --check` (via
+#    `--experimental-strip-types`) as a syntax-only parse pass. That was verified,
+#    empirically, to be a no-op: `node --check` only does its syntax parse for
+#    CommonJS-format sources, and every `.ts` file in this repo is ESM
+#    (`import`/`export`). Copying worker/mapping.ts, injecting a real unbalanced
+#    parenthesis into a live statement, and running the exact check command against
+#    it returns exit 0 — the step was green regardless of file content.
+# 3. The alternative — actually importing each file with
+#    `node --experimental-strip-types` so real parsing happens — is not an honest
+#    substitute either: Node's type-stripping only erases type syntax, it does not
+#    transform TypeScript, so it rejects constructor parameter properties (for
+#    example `worker/player.ts`'s `constructor(private readonly spawn: SpawnFn)`).
+#    That file is correct — `orca plugin test .` passes it — but a bare Node 22
+#    runtime cannot load it at all. That check would fail on known-good code, not
+#    just on real bugs, which is worse than running nothing.
+# 4. A real TypeScript check (tsc, or anything stricter than Node's own erasable-
+#    syntax stripping) would mean installing a TypeScript toolchain, and this repo
+#    intentionally ships with no `package.json` and no dependencies of any kind.
+#
+# So this job does exactly one thing, and it is real: it checks that
+# `orca-plugin.json` parses as JSON and has the shape the plugin loader requires.
+# Nothing here reads or executes the TypeScript sources.
 
 name: CI
 
@@ -34,7 +46,7 @@ on:
   pull_request:
 
 jobs:
-  parse-and-manifest-check:
+  manifest-check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -42,19 +54,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-
-      - name: Syntax-check TypeScript sources (no orca runtime, no test execution)
-        run: |
-          set -e
-          status=0
-          while IFS= read -r -d '' file; do
-            echo "checking $file"
-            if ! node --experimental-strip-types --check "$file"; then
-              echo "::error file=$file::failed syntax check"
-              status=1
-            fi
-          done < <(find worker src -type f -name '*.ts' -print0 | sort -z)
-          exit "$status"
 
       - name: Sanity-check orca-plugin.json
         run: |
