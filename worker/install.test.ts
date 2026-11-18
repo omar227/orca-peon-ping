@@ -327,6 +327,35 @@ test('status reports an update when the recorded version differs', async () => {
   assert.equal((await installer.status({ ...entry, version: '1.0.0' })).updateAvailable, false)
 })
 
+test('an adopted pack is never offered an update and never overwritten', async () => {
+  writeManifestAt('peon', '0.9.0')
+  const store = new Store(memoryStoreApi())
+  const installer = new PackInstaller(store, {
+    home: tmpHome,
+    fetchImpl: serving(packTarball({ version: '1.0.0' }))
+  })
+  assert.equal(await installer.adoptIfPresent('peon'), true)
+
+  const status = await installer.status(entry)
+  assert.equal(status.adopted, true)
+  assert.equal(status.installedVersion, '0.9.0')
+  assert.equal(status.updateAvailable, false)
+  assert.equal(status.removable, false)
+
+  await assert.rejects(() => installer.install(entry), /adopted/)
+  assert.ok(readFileSync(installer.manifestPath('peon'), 'utf8').includes('0.9.0'))
+  assert.equal((await store.getInstalled())['peon'].adopted, true)
+  assert.deepEqual(packsRootEntries(), ['peon'])
+})
+
+test('a non-string manifest_sha256 is treated as absent rather than crashing', async () => {
+  const store = new Store(memoryStoreApi())
+  const installer = new PackInstaller(store, { home: tmpHome, fetchImpl: serving(packTarball()) })
+  await installer.install({ ...entry, manifest_sha256: null as unknown as string })
+  assert.ok(existsSync(installer.manifestPath('peon')))
+  assert.equal((await store.getInstalled())['peon'].manifestSha256, null)
+})
+
 test('status reports an uninstalled pack as absent and not removable', async () => {
   const installer = new PackInstaller(new Store(memoryStoreApi()), { home: tmpHome })
   assert.deepEqual(await installer.status(entry), {

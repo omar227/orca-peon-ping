@@ -172,6 +172,12 @@ export class PackInstaller {
    */
   async install(entry: RegistryPack): Promise<void> {
     const dest = this.packDir(entry.name)
+    if ((await this.#store.getInstalled())[entry.name]?.adopted === true) {
+      throw new Error(
+        `pack ${entry.name} was adopted from another tool and will not be overwritten`
+      )
+    }
+
     const root = packsRoot(this.#home)
     mkdirSync(root, { recursive: true })
 
@@ -189,13 +195,14 @@ export class PackInstaller {
       if (!existsSync(manifestFile)) {
         throw new Error(`pack ${entry.name} has no ${MANIFEST_FILE}`)
       }
+      // The registry index is not field-validated, so treat anything but a string as absent
+      // rather than failing a good pack on its one optional integrity field.
+      const expectedSha = typeof entry.manifest_sha256 === 'string' ? entry.manifest_sha256 : null
       const manifestBytes = readFileSync(manifestFile)
-      if (entry.manifest_sha256 !== undefined) {
+      if (expectedSha !== null) {
         const actual = sha256(manifestBytes)
-        if (actual !== entry.manifest_sha256.toLowerCase()) {
-          throw new Error(
-            `pack ${entry.name} manifest sha256 is ${actual}, expected ${entry.manifest_sha256}`
-          )
+        if (actual !== expectedSha.toLowerCase()) {
+          throw new Error(`pack ${entry.name} manifest sha256 is ${actual}, expected ${expectedSha}`)
         }
       }
       parseManifest(manifestBytes.toString('utf8'))
@@ -204,7 +211,7 @@ export class PackInstaller {
       await this.#record(entry.name, {
         version: entry.version,
         sourceRef: entry.source_ref,
-        manifestSha256: entry.manifest_sha256 ?? null,
+        manifestSha256: expectedSha,
         adopted: false
       })
     } finally {
@@ -275,14 +282,18 @@ export class PackInstaller {
   async status(entry: RegistryPack): Promise<PackStatus> {
     const recorded = (await this.#store.getInstalled())[entry.name]
     const present = existsSync(this.packDir(entry.name))
+    const adopted = recorded?.adopted ?? false
     const installedVersion = recorded?.version ?? null
     return {
       name: entry.name,
       present,
-      adopted: recorded?.adopted ?? false,
+      adopted,
       installedVersion,
-      updateAvailable: present && installedVersion !== null && installedVersion !== entry.version,
-      removable: present && recorded !== undefined && !recorded.adopted
+      // An adopted pack is never offered an update: installing one would delete the directory
+      // peon-ping put there, which `install` refuses anyway.
+      updateAvailable:
+        present && !adopted && installedVersion !== null && installedVersion !== entry.version,
+      removable: present && recorded !== undefined && !adopted
     }
   }
 
