@@ -1,4 +1,4 @@
-import * as path from 'node:path'
+import { isAbsolute, join, resolve, sep } from 'node:path'
 
 export type CespSound = { file: string; label?: string; sha256?: string }
 
@@ -51,15 +51,15 @@ export function resolveCategory(manifest: CespManifest, category: string): CespS
 }
 
 export function resolveSoundPath(packDir: string, file: string): string {
-  if (path.isAbsolute(file)) {
+  if (isAbsolute(file)) {
     throw new Error(`CESP sound file must be a relative path: ${file}`)
   }
 
-  const relative = file.includes('/') ? file : path.join('sounds', file)
-  const resolvedPackDir = path.resolve(packDir)
-  const resolved = path.resolve(resolvedPackDir, relative)
+  const relative = file.includes('/') ? file : join('sounds', file)
+  const resolvedPackDir = resolve(packDir)
+  const resolved = resolve(resolvedPackDir, relative)
 
-  if (resolved !== resolvedPackDir && !resolved.startsWith(resolvedPackDir + path.sep)) {
+  if (resolved !== resolvedPackDir && !resolved.startsWith(resolvedPackDir + sep)) {
     throw new Error(`CESP sound file escapes the pack directory: ${file}`)
   }
 
