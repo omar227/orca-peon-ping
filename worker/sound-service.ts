@@ -93,12 +93,23 @@ export type SoundServiceDeps = {
 }
 
 /**
- * Decides whether an event becomes a sound, a notification, or nothing at all. The order is
- * fixed and stops at the first miss: the category's setting, mute, the rate-limit gate, an
- * active pack, that pack's coverage of the category, a sound that survives verification, and a
- * player that can play it. A miss at the setting or the gate is silent; a miss at mute, coverage
- * or playback support is worth telling the person about, for the two categories they would
+ * Decides whether an event becomes a sound, a notification, or nothing at all.
+ *
+ * The order of the *checks* is fixed and stops at the first miss: the category's setting, mute,
+ * an active pack, that pack's coverage of the category, a player that can play it, and then a
+ * sound that survives verification. A miss at the setting is silent; a miss at mute, coverage or
+ * playback support is worth telling the person about, for the two categories they would
  * otherwise wait on.
+ *
+ * The *gate* sits between the two: everything that decides whether a sound can be produced is
+ * resolved first, then the gate is consumed, then the sound or its stand-in notification is
+ * emitted. Two reasons. One, the design says the fallback notification "respects … both
+ * rate-limit gates, so it can never be noisier than the sound would have been", and the muted
+ * path used to return before the gate — a muted user with a fleet got one desktop toast per
+ * blocked agent, during exactly the meeting mute exists for. Two, budget is better spent on
+ * something that will really be emitted. Hashing candidate files stays *behind* the gate, so a
+ * fleet cannot make the worker verify the same pack four times in half a second; a category
+ * whose every sound fails verification therefore still consumes the gate, as it always did.
  */
 export class SoundService {
   readonly #store: Store
@@ -124,28 +135,44 @@ export class SoundService {
   async handle(category: PlayableCategory, agentTitle: string | undefined): Promise<void> {
     const settings = await this.#readSettings()
 
+    // A category switched off is the one miss that is a deliberate choice, not a failure: it
+    // neither plays, notifies, nor spends the gate.
     if (!settings[SETTING_FOR[category]]) return
-    if (settings.muted) return this.#maybeNotify(category, agentTitle, settings)
+
+    const playable = await this.#resolvePlayable(category, settings)
+
     if (!this.#gate.allow(category)) return
+    if (playable === null) return this.#maybeNotify(category, agentTitle, settings)
 
-    const packName = await this.#store.getActivePack()
-    if (packName === null) return this.#maybeNotify(category, agentTitle, settings)
-
-    const sounds = this.#soundsFor(packName, category)
-    if (sounds.length === 0) return this.#maybeNotify(category, agentTitle, settings)
-
-    const chosen = await this.#firstVerified(packName, category, sounds)
+    const chosen = await this.#firstVerified(playable.packName, category, playable.sounds)
     if (chosen === null) {
-      this.#log(`no playable ${category} sound in pack ${packName}`)
+      this.#log(`no playable ${category} sound in pack ${playable.packName}`)
       return
-    }
-
-    if (this.#player.unavailableReason !== null) {
-      return this.#maybeNotify(category, agentTitle, settings)
     }
 
     this.#player.play(chosen.path, settings.volume)
     await this.#store.setLastPlayed(category, chosen.sound.file)
+  }
+
+  /**
+   * The sounds that could play for this category, or null when none can — mute, no active pack,
+   * a pack that does not cover it, or a platform with no player. All four are "a sound was
+   * warranted and could not play", which is the one mechanism the fallback notification serves.
+   */
+  async #resolvePlayable(
+    category: PlayableCategory,
+    settings: Settings
+  ): Promise<{ packName: string; sounds: CespSound[] } | null> {
+    if (settings.muted) return null
+    if (this.#player.unavailableReason !== null) return null
+
+    const packName = await this.#store.getActivePack()
+    if (packName === null) return null
+
+    const sounds = this.#soundsFor(packName, category)
+    if (sounds.length === 0) return null
+
+    return { packName, sounds }
   }
 
   #packDir(packName: string): string {

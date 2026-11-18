@@ -253,3 +253,89 @@ test('settings the host cannot answer for fall back to their declared defaults',
   assert.deepEqual(toSettings(null), DEFAULT_SETTINGS)
   assert.deepEqual(toSettings({ volume: 'loud', muted: 'yes' }), DEFAULT_SETTINGS)
 })
+
+/**
+ * The design: the fallback notification "respects the per-category toggles and both rate-limit
+ * gates, so it can never be noisier than the sound would have been." It did not — the muted path
+ * returned before the gate, so a muted user with a fleet got one desktop toast per blocked agent,
+ * during exactly the meeting-or-call that mute exists for.
+ */
+test('a muted fleet produces at most one notification per 500 ms per category', async () => {
+  writePack('peon', { 'input.required': ['help.wav'], 'task.error': ['oops.wav'] })
+  let now = 0
+  const gate = new SoundGate({ now: () => now })
+  const { service, store, notifications } = harness({
+    gate,
+    settings: { muted: true, notifyWhenMuted: true }
+  })
+  await store.setActivePack('peon')
+
+  for (const agent of ['one', 'two', 'three', 'four']) {
+    await service.handle('input.required', agent)
+  }
+  assert.equal(notifications.length, 1)
+
+  now = 499
+  await service.handle('input.required', 'five')
+  assert.equal(notifications.length, 1)
+
+  now = 500
+  await service.handle('input.required', 'six')
+  assert.equal(notifications.length, 2)
+
+  // The global floor applies to a notification exactly as it would to the sound it stands in
+  // for, so a second category inside 500 ms waits its turn.
+  await service.handle('task.error', 'seven')
+  assert.equal(notifications.length, 2)
+
+  now = 1000
+  await service.handle('task.error', 'eight')
+  assert.equal(notifications.length, 3)
+})
+
+test('a muted event still spends the gate, so the sound after it is dropped too', async () => {
+  writePack('peon', { 'task.complete': ['done.wav'] })
+  let muted = true
+  const gate = new SoundGate({ now: () => 0 })
+  const played: { path: string; volume: number }[] = []
+  const store = new Store(memoryStoreApi())
+  const service = new SoundService({
+    store,
+    gate,
+    player: {
+      kind: 'afplay',
+      unavailableReason: null,
+      play: (path, volume) => {
+        played.push({ path, volume })
+      }
+    },
+    readSettings: async () => ({ ...DEFAULT_SETTINGS, muted }),
+    notify: async () => {},
+    home
+  })
+  await store.setActivePack('peon')
+
+  await service.handle('task.complete', 'Claude')
+  muted = false
+  await service.handle('task.complete', 'Claude')
+
+  assert.equal(played.length, 0)
+})
+
+test('an unsupported platform notifies before any file is hashed', async () => {
+  writePack('peon', { 'input.required': ['help.wav'] })
+  let verifications = 0
+  const { service, store, notifications } = harness({
+    player: createPlayer('linux'),
+    verifyFile: async () => {
+      verifications++
+      return true
+    }
+  })
+  await store.setActivePack('peon')
+
+  await service.handle('input.required', 'Claude')
+
+  assert.equal(notifications.length, 1)
+  assert.equal(verifications, 0)
+})
