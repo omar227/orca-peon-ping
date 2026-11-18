@@ -52,9 +52,7 @@ const rows: PackRowView[] = [
     description: 'Duke Nukem sound pack from Duke Nukem',
     trustTier: 'official',
     sizeBytes: 7_737_086,
-    soundCount: 24,
-    busy: true,
-    progressBytes: 18_350_080
+    soundCount: 24
   }),
   pack({
     name: 'protoss_probe',
@@ -106,6 +104,22 @@ const view = (over: Partial<PackListView> = {}): PackListView => ({
   ...over
 })
 
+/**
+ * The installing row lives in its own scenario, and is named so that nobody can mistake it for a
+ * real download. `orca plugin dev watch --check` prints every scenario's spinner label on each
+ * hot reload, and a real pack name there reads as "this plugin is downloading that pack, again,
+ * right now".
+ */
+const installing = pack({
+  name: 'example-pack',
+  displayName: 'Example Pack (fixture)',
+  description: 'Not a real pack: the scenario that shows an install in progress.',
+  sizeBytes: 2_400_000,
+  soundCount: 20,
+  busy: true,
+  progressBytes: 18_350_080
+})
+
 const uninstalled = rows.map((row) => ({
   ...row,
   progressBytes: null,
@@ -119,6 +133,7 @@ const uninstalled = rows.map((row) => ({
 
 export default defineCheck({
   default: { requests: { 'packs.list': view() } },
+  installing: { requests: { 'packs.list': view({ rows: [installing, ...rows] }) } },
   empty: { requests: { 'packs.list': view({ rows: uninstalled, activePack: null }) } },
   stale: {
     requests: {
