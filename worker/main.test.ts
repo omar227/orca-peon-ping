@@ -7,6 +7,7 @@ import type { Installer, Registry } from './main.ts'
 import * as main from './main.ts'
 import type { Player } from './player.ts'
 import type { RegistryIndex, RegistryPack } from './registry.ts'
+import { syntheticIndex } from './testing/registry-fixture.ts'
 
 let home: string
 let played: { path: string; volume: number }[]
@@ -411,6 +412,61 @@ test('an install after a failed first run retires the first-run error', async ()
   const recovered = (await worker.request('packs.list', {})) as PackListView
   assert.equal(recovered.firstRunError, null)
   assert.equal(recovered.activePack?.name, 'peon')
+  assert.deepEqual(worker.refusals, [])
+  await worker.deactivate()
+})
+
+/**
+ * Six-row fixtures are what let a 256 KiB limit through twelve reviews: at the registry's real
+ * size the pack list crossed Orca's per-value cap and `packs.list` failed outright. These two
+ * drive the worker at 500 packs — past today's 382, with headroom as the registry grows.
+ */
+test('packs.list answers for a 500-pack registry', async () => {
+  useStubs({ registry: stubRegistry({ index: syntheticIndex(500) }) })
+  const worker = await mountWorker(main, {
+    host: mockHost({ storage: { firstRunDone: true } })
+  })
+
+  const view = (await worker.request('packs.list', {})) as PackListView
+
+  assert.equal(view.rows.length, 500)
+  assert.equal(view.error, null)
+  assert.equal(view.rows[499]?.name, 'synthetic-pack-0500')
+  assert.deepEqual(worker.refusals, [])
+  await worker.deactivate()
+})
+
+test('a pack list past the push limit is skipped rather than failing the mutation', async () => {
+  writePack('peon', { 'task.complete': ['done.wav'] })
+  useStubs({ registry: stubRegistry({ index: syntheticIndex(500) }) })
+  const host = mockHost({ storage: { activePack: 'glados', firstRunDone: true } })
+  const worker = await mountWorker(main, { host })
+
+  // 500 packs serialise to ~300 KB of `packs.changed`, over Orca's 256 KiB post cap.
+  await worker.request('packs.activate', { name: 'peon' })
+
+  assert.equal(host.data().storage.activePack, 'peon')
+  assert.deepEqual(
+    worker.posts.filter((post) => post.event === 'packs.changed'),
+    []
+  )
+  assert.ok(worker.logs.some((line) => line.includes('push limit')))
+  assert.deepEqual(worker.refusals, [])
+  await worker.deactivate()
+})
+
+test('a pack list under the push limit is still posted', async () => {
+  writePack('peon', { 'task.complete': ['done.wav'] })
+  useStubs({ registry: stubRegistry({ index: syntheticIndex(20) }) })
+  const worker = await mountWorker(main, {
+    host: mockHost({ storage: { activePack: 'glados', firstRunDone: true } })
+  })
+
+  await worker.request('packs.activate', { name: 'peon' })
+
+  const posted = worker.posts.filter((post) => post.event === 'packs.changed')
+  assert.ok(posted.length > 0)
+  assert.equal((posted[posted.length - 1]?.payload as PackListView).rows.length, 20)
   assert.deepEqual(worker.refusals, [])
   await worker.deactivate()
 })

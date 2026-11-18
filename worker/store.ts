@@ -1,12 +1,10 @@
 import type { PlayableCategory } from './mapping.ts'
-import type { RegistryIndex } from './registry.ts'
 
 const KEYS = {
   activePack: 'activePack',
   installedPacks: 'installedPacks',
   lastPlayed: 'lastPlayed',
-  firstRunDone: 'firstRunDone',
-  registryCache: 'registryCache'
+  firstRunDone: 'firstRunDone'
 } as const
 
 export type InstalledPack = {
@@ -17,8 +15,6 @@ export type InstalledPack = {
   installedAt: number
   adopted: boolean
 }
-
-export type RegistryCache = { fetchedAt: number; index: RegistryIndex }
 
 export type StoreApi = {
   get<T>(key: string): Promise<T | null>
@@ -77,13 +73,5 @@ export class Store {
 
   async markFirstRunDone(): Promise<void> {
     await this.#api.set(KEYS.firstRunDone, true)
-  }
-
-  async getRegistryCache(): Promise<RegistryCache | null> {
-    return this.#api.get<RegistryCache>(KEYS.registryCache)
-  }
-
-  async setRegistryCache(value: RegistryCache): Promise<void> {
-    await this.#api.set(KEYS.registryCache, value)
   }
 }

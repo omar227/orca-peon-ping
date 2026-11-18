@@ -20,6 +20,14 @@ import { Store, type StoreApi } from './store.ts'
 
 const STATUS_BAR_ITEM_ID = 'active-pack'
 const DEFAULT_PACK = 'peon'
+/**
+ * What Orca accepts in one `orca.panels.post` payload: 256 KiB, the same number as
+ * `PLUGIN_STORAGE_VALUE_MAX_BYTES` in
+ * out/shared/plugins/workers/plugin-host-api-storage-schemas.js, and the "at most 256 KiB"
+ * in the `panels.post` typings. A `packs.changed` for today's 382-pack registry measures
+ * ~129 KB — half the cap, and it grows with the registry, so the push checks before it posts.
+ */
+const POST_MAX_BYTES = 256 * 1024
 const PLAYABLE_CATEGORIES: readonly PlayableCategory[] = [
   'session.start',
   'task.acknowledge',
@@ -119,7 +127,9 @@ export function createDeps(orca: OrcaWorkerApi, overrides: DepOverrides = {}): W
     tracker: overrides.tracker ?? new PaneTracker(),
     gate,
     player,
-    registry: overrides.registry ?? new RegistryClient(store),
+    registry:
+      overrides.registry ??
+      new RegistryClient({ home, log: (message) => orca.log(`peon-ping: ${message}`) }),
     installer: overrides.installer ?? new PackInstaller(store, { home }),
     service,
     readSettings,
@@ -391,9 +401,24 @@ class PeonPing {
     await this.#post()
   }
 
+  /**
+   * Fire-and-forget, and deliberately unable to fail the mutation that triggered it. A payload
+   * over Orca's push limit is not attempted at all: Orca would reject it, and that rejection
+   * would surface as the install or activation failing. Skipping leaves the panel one explicit
+   * `packs.list` behind, which it asks for after every action it takes anyway.
+   */
   async #post(): Promise<void> {
     try {
-      this.#orca.panels.post('packs.changed', await this.#buildView())
+      const view = await this.#buildView()
+      const bytes = Buffer.byteLength(JSON.stringify(view), 'utf8')
+      if (bytes > POST_MAX_BYTES) {
+        this.#orca.log(
+          `peon-ping: the pack list is ${bytes} bytes, past the ${POST_MAX_BYTES}-byte push ` +
+            'limit, so the panel keeps what it last asked for'
+        )
+        return
+      }
+      this.#orca.panels.post('packs.changed', view)
     } catch (error) {
       this.#orca.log(`peon-ping: could not tell the panel what changed: ${messageOf(error)}`)
     }
