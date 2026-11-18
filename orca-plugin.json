@@ -1,0 +1,92 @@
+{
+  "$schema": "https://raw.githubusercontent.com/stablyai/orca/main/docs/schemas/plugins/orca-plugin.v2.schema.json",
+  "manifestVersion": 2,
+  "execution": "trusted-worker",
+  "id": "peon-ping",
+  "name": "Peon Ping",
+  "version": "1.0.0",
+  "description": "Character voice lines when your agents finish, fail, or need you. 380+ sound packs from the OpenPeon registry. macOS only in this version.",
+  "license": "MIT",
+  "engines": {
+    "orca": ">=1.4.259"
+  },
+  "pluginApi": 1,
+  "main": "worker/main.ts",
+  "contributes": {
+    "panels": [
+      {
+        "id": "packs",
+        "title": "Peon Ping",
+        "icon": "bell",
+        "entry": "src/panel.tsx",
+        "ui": "components"
+      }
+    ],
+    "statusBarItems": [
+      {
+        "id": "active-pack",
+        "text": "Peon Ping",
+        "icon": "bell"
+      }
+    ],
+    "events": [{ "on": "agent.status.changed" }],
+    "settings": [
+      {
+        "key": "volume",
+        "type": "number",
+        "default": 0.5,
+        "title": "Volume",
+        "minimum": 0,
+        "maximum": 1
+      },
+      {
+        "key": "muted",
+        "type": "boolean",
+        "default": false,
+        "title": "Mute all sounds"
+      },
+      {
+        "key": "playSessionStart",
+        "type": "boolean",
+        "default": true,
+        "title": "Play when an agent starts"
+      },
+      {
+        "key": "playTaskAcknowledge",
+        "type": "boolean",
+        "default": true,
+        "title": "Play when an agent picks up work"
+      },
+      {
+        "key": "playInputRequired",
+        "type": "boolean",
+        "default": true,
+        "title": "Play when an agent needs you"
+      },
+      {
+        "key": "playTaskComplete",
+        "type": "boolean",
+        "default": true,
+        "title": "Play when an agent finishes"
+      },
+      {
+        "key": "playTaskError",
+        "type": "boolean",
+        "default": true,
+        "title": "Play when an agent fails"
+      },
+      {
+        "key": "notifyWhenMuted",
+        "type": "boolean",
+        "default": true,
+        "title": "Show a notification when a sound can't play"
+      }
+    ]
+  },
+  "capabilities": [
+    { "kind": "agent:read" },
+    { "kind": "storage:own" },
+    { "kind": "settings:own" },
+    { "kind": "notifications:show" }
+  ]
+}
