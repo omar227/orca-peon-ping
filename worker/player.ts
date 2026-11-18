@@ -10,10 +10,20 @@ export type Player = {
 
 const UNSUPPORTED_REASON = 'Audio playback is macOS-only in this version.'
 
-const defaultSpawn: SpawnFn = (command, args) => {
-  const child = nodeSpawn(command, args, { detached: true, stdio: 'ignore' })
-  child.unref()
+/**
+ * Spawns a detached player process. A child that cannot be launched at all (no such command, a
+ * sandbox denial) emits `error`, which Node turns into an uncaught exception — and a dead worker
+ * is the loudest way for this plugin to stop working — so the listener is never optional.
+ */
+export function spawnDetached(onError?: (error: Error) => void): SpawnFn {
+  return (command, args) => {
+    const child = nodeSpawn(command, args, { detached: true, stdio: 'ignore' })
+    child.on('error', (error) => onError?.(error))
+    child.unref()
+  }
 }
+
+const defaultSpawn: SpawnFn = spawnDetached()
 
 function clampVolume(volume: number): number {
   return Math.min(1, Math.max(0, volume))

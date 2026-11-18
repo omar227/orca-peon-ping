@@ -1,5 +1,5 @@
 import { assert, test } from 'orca/testing'
-import { createPlayer, type SpawnFn } from './player.ts'
+import { createPlayer, spawnDetached, type SpawnFn } from './player.ts'
 
 const calls: { command: string; args: readonly string[] }[] = []
 const spy: SpawnFn = (command, args) => { calls.push({ command, args }) }
@@ -31,4 +31,11 @@ test('an unsupported platform plays nothing and says why', () => {
 
 test('a supported player reports no reason', () => {
   assert.equal(createPlayer('darwin', spy).unavailableReason, null)
+})
+
+test('a command that cannot launch is reported instead of crashing the worker', async () => {
+  const errors: Error[] = []
+  spawnDetached((error) => errors.push(error))('peon-ping-no-such-command', [])
+  await new Promise((resolve) => setTimeout(resolve, 100))
+  assert.equal(errors.length, 1)
 })
