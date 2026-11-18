@@ -74,3 +74,41 @@ test('the pane map is capped at maxPanes', () => {
   for (const n of [1, 2, 3, 4]) t.observe(ev({ paneKey: `p${n}`, sessionId: `s${n}` }))
   assert.ok(t.size <= 2)
 })
+
+/**
+ * The real sequence out of Orca's codex failure detector, which reports
+ * `{state:'done', mainAgent:{state:'done', outcome:'failure'}}` for a pane that is already
+ * `done`. Deduping on the state alone meant the failure arrived after the completion sound had
+ * been played and was then swallowed: a failed agent said "Job's done!" and nothing else.
+ */
+test('a done pane that later reports failure plays the error sound', () => {
+  const t = new PaneTracker()
+  assert.equal(t.observe(ev({ state: 'working' })), 'session.start')
+  assert.equal(t.observe(ev({ state: 'done' })), 'task.complete')
+  assert.equal(
+    t.observe(ev({ state: 'done', mainAgent: { state: 'done', outcome: 'failure' } })),
+    'task.error'
+  )
+})
+
+test('the same done outcome reported twice still plays one sound', () => {
+  const t = new PaneTracker()
+  const done = ev({ state: 'done', mainAgent: { state: 'done', outcome: 'success' } })
+  assert.equal(t.observe(done), 'task.complete')
+  assert.equal(t.observe(done), null)
+  assert.equal(t.observe(ev({ state: 'done', mainAgent: { state: 'done' } })), 'task.complete')
+})
+
+/**
+ * Deliberate, and the reason the dedup key is `(state, outcome)` rather than something that
+ * collapses the two permission states: the outcome is undefined throughout, the state really
+ * changes, and an agent still waiting on a human is worth saying again. The 500 ms per-category
+ * gate is what stops a flapping pane from being noisy.
+ */
+test('blocked to waiting and back re-fires input.required', () => {
+  const t = new PaneTracker()
+  assert.equal(t.observe(ev({ state: 'blocked' })), 'input.required')
+  assert.equal(t.observe(ev({ state: 'waiting' })), 'input.required')
+  assert.equal(t.observe(ev({ state: 'blocked' })), 'input.required')
+  assert.equal(t.observe(ev({ state: 'blocked' })), null)
+})

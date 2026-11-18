@@ -27,6 +27,8 @@ export type AgentStatusEvent = {
 
 type PaneRecord = {
   state: AgentState
+  /** Part of the dedup key, not decoration: `done` → `done` can change only the outcome. */
+  outcome?: TurnOutcome
   sessionId?: string
   seenAt: number
 }
@@ -57,6 +59,7 @@ export class PaneTracker {
 
     this.#panes.set(event.paneKey, {
       state: event.state,
+      outcome: event.mainAgent?.outcome,
       sessionId: event.sessionId,
       seenAt: now
     })
@@ -76,7 +79,18 @@ export class PaneTracker {
       return 'session.start'
     }
 
-    if (prior && prior.state === event.state) return null
+    // Deduping on the state alone swallowed the one transition that matters most: Orca's codex
+    // failure detector reports `done` with no outcome and then `done` with `outcome: "failure"`
+    // for the same pane, so a failed agent played "Job's done!" and never played the error line.
+    // The outcome is part of what makes a report distinct, so both are seen.
+    //
+    // `blocked` → `waiting` → `blocked` still re-fires `input.required`, deliberately: the
+    // outcome is undefined throughout and the state really does change each time, and an agent
+    // still waiting on a human is exactly what this plugin exists to keep saying. A burst inside
+    // 500 ms collapses to one sound at the per-category gate.
+    if (prior && prior.state === event.state && prior.outcome === event.mainAgent?.outcome) {
+      return null
+    }
 
     switch (event.state) {
       case 'working':
